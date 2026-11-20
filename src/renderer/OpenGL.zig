@@ -2,9 +2,11 @@
 pub const OpenGL = @This();
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const gl = @import("opengl");
 const egl = gl.egl;
+const wgl = @import("opengl/wgl.zig");
 const shadertoy = @import("shadertoy.zig");
 const apprt = @import("../apprt.zig");
 const font = @import("../font/main.zig");
@@ -12,7 +14,7 @@ const configpkg = @import("../config.zig");
 const rendererpkg = @import("../renderer.zig");
 const Renderer = rendererpkg.GenericRenderer(OpenGL);
 const Dmabuf = @import("Dmabuf.zig");
-pub const Device = @import("opengl/Device.zig");
+pub const Device = if (builtin.os.tag == .windows) wgl.Device else @import("opengl/Device.zig");
 
 pub const GraphicsAPI = OpenGL;
 pub const Target = @import("opengl/Target.zig");
@@ -35,6 +37,21 @@ pub const swap_chain_count = 3;
 
 const log = std.log.scoped(.opengl);
 
+test "OpenGL GLAD empty resolver reload state" {
+    const Resolver = struct {
+        fn resolve(_: [*:0]const u8) callconv(.c) ?*const fn () callconv(.c) void {
+            return null;
+        }
+    };
+    for (0..3) |_| {
+        try std.testing.expectError(error.GLInitFailed, gl.glad.load(&Resolver.resolve));
+        try std.testing.expect(gl.glad.context.glad_loader_handle == null);
+        try std.testing.expect(gl.glad.context.GetString == null);
+        gl.glad.unload();
+        try std.testing.expect(gl.glad.context.glad_loader_handle == null);
+    }
+}
+
 /// We require at least OpenGL 4.3
 pub const MIN_VERSION_MAJOR = 4;
 pub const MIN_VERSION_MINOR = 3;
@@ -47,13 +64,21 @@ blending: configpkg.Config.AlphaBlending,
 /// The shared render device.
 device: *const Device,
 
-egl_context: *gl.egl.Context,
+context: if (builtin.os.tag == .windows) wgl.Context else *gl.egl.Context,
 
 pub fn init(
     alloc: Allocator,
     device: *const Device,
     opts: rendererpkg.Options,
 ) !OpenGL {
+    if (comptime builtin.os.tag == .windows) {
+        return .{
+            .alloc = alloc,
+            .blending = opts.config.blending,
+            .device = device,
+            .context = try device.createContext(),
+        };
+    }
     const display = device.display;
 
     // Bind to OpenGL API explicitly before we create the context,
@@ -85,13 +110,17 @@ pub fn init(
         .alloc = alloc,
         .blending = opts.config.blending,
         .device = device,
-        .egl_context = context,
+        .context = context,
     };
 }
 
 pub fn deinit(self: *OpenGL) void {
-    self.device.display.releaseCurrent();
-    self.egl_context.destroy(self.device.display) catch {};
+    if (comptime builtin.os.tag == .windows) {
+        self.context.deinit();
+    } else {
+        self.device.display.releaseCurrent();
+        self.context.destroy(self.device.display) catch {};
+    }
     self.* = undefined;
 }
 
@@ -200,16 +229,21 @@ fn prepareContext(getProcAddress: anytype) !void {
 /// function pointers so all subsequent GL work on this thread is valid.
 pub fn threadEnter(self: *OpenGL, surface: *apprt.Surface) !void {
     _ = surface;
-    try self.device.display.makeCurrent(null, null, self.egl_context);
-    // Load our function pointers for this thread's threadlocal.
-    try prepareContext(&gl.egl.getProcAddress);
+    if (comptime builtin.os.tag == .windows) {
+        try self.context.makeCurrent();
+        errdefer wgl.Context.releaseCurrent();
+        try prepareContext(&wgl.getProcAddress);
+    } else {
+        try self.device.display.makeCurrent(null, null, self.context);
+        try prepareContext(&gl.egl.getProcAddress);
+    }
 }
 
 /// Callback called by renderer.Thread when it exits. Called on the render
 /// thread; unbinds the context from this thread so it can be destroyed on
 /// the main thread.
 pub fn threadExit(self: *OpenGL) void {
-    self.device.display.releaseCurrent();
+    if (comptime builtin.os.tag == .windows) wgl.Context.releaseCurrent() else self.device.display.releaseCurrent();
     gl.glad.unload();
 }
 
@@ -279,13 +313,16 @@ pub fn present(
     target: Target,
     presentation_health: rendererpkg.Health,
 ) !ExportedFrame {
-    // We only export DMABUFs when the apprt can present them.
-    // Otherwise, use CPU buffers.
-    if (presentation_health == .healthy) {
-        if (target.exportDmabuf(self.device.display, self.egl_context)) |dmabuf| {
-            return .{ .dmabuf = dmabuf };
-        } else |_| {
-            log.warn("failed to export DMABUF, falling back to CPU presentation", .{});
+    // DMA-BUF uses Unix file descriptors, not Windows handles. On Windows,
+    // use CPU buffers without instantiating the DMA-BUF export path.
+    if (comptime builtin.os.tag != .windows) {
+        // We only export DMABUFs when the apprt can present them.
+        if (presentation_health == .healthy) {
+            if (target.exportDmabuf(self.device.display, self.context)) |dmabuf| {
+                return .{ .dmabuf = dmabuf };
+            } else |_| {
+                log.warn("failed to export DMABUF, falling back to CPU presentation", .{});
+            }
         }
     }
 
@@ -299,7 +336,9 @@ pub fn present(
 
 /// A finished frame exported for presentation by the apprt.
 pub const ExportedFrame = union(enum) {
-    dmabuf: Dmabuf,
+    // Keep the tag for the shared interface, but make this payload impossible
+    // on Windows instead of treating Unix descriptors as Windows handles.
+    dmabuf: if (builtin.os.tag == .windows) noreturn else Dmabuf,
     memory: Memory,
 
     /// RGBA8 pixel data with premultiplied alpha, tightly packed
@@ -317,11 +356,26 @@ pub const ExportedFrame = union(enum) {
 
     pub fn deinit(self: ExportedFrame) void {
         switch (self) {
-            .dmabuf => |v| v.deinit(),
+            .dmabuf => |v| if (comptime builtin.os.tag == .windows) unreachable else v.deinit(),
             .memory => |v| v.deinit(),
         }
     }
 };
+
+test "ExportedFrame platform payload and memory cleanup" {
+    const testing = std.testing;
+    try testing.expect(@FieldType(ExportedFrame, "dmabuf") ==
+        (if (builtin.os.tag == .windows) noreturn else Dmabuf));
+
+    const frame: ExportedFrame = .{ .memory = .{
+        .width = 1,
+        .height = 1,
+        .pixels = try testing.allocator.alloc(u8, 4),
+        .alloc = testing.allocator,
+    } };
+    defer frame.deinit();
+    try testing.expectEqual(@as(usize, 4), frame.memory.pixels.len);
+}
 
 /// Returns the options to use when constructing buffers.
 pub inline fn bufferOptions(self: OpenGL) bufferpkg.Options {

@@ -1,0 +1,14 @@
+$$ Own-process GPU-only attribution. No global GFlags, heap changes or dumps.
+$$ Run CDB with -hd, -G and a process-local symbol cache. Not readiness evidence.
+!htrace -enable 0x10000
+$$ htrace on this OS reports history but no PCs. Capture live basic stacks
+$$ only after the unchanged warmup, correlated by htrace creator thread ID.
+bu ntdll!NtCreateEvent ".printf \"LOCALTERM_EVENT_CREATE tid=%x out=%p\n\", @$tid, @rcx; k; gc"
+bd 0
+bu ntdll!NtCreateThreadEx ".printf \"LOCALTERM_THREAD_CREATE tid=%x out=%p\n\", @$tid, @rcx; k; gc"
+bd 1
+bu ntdll!NtDuplicateObject ".if (@rdx == 0xfffffffffffffffe) { .printf \"LOCALTERM_SELF_THREAD_DUP tid=%x out=%p\n\", @$tid, @r9; k }; gc"
+bd 2
+bm *!localterm_htrace_marker ".if (@rcx == 1) { .echo LOCALTERM_HTRACE_BASELINE; !htrace -snapshot; be 0 1 2; gc } .else { bd 0 1 2; .echo LOCALTERM_HTRACE_FINAL; !htrace -diff; gc }"
+bl
+g

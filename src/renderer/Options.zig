@@ -26,3 +26,7 @@ rt_surface: *apprt.Surface,
 
 /// The renderer thread.
 thread: *renderer.Thread,
+
+/// Controlled native Thai fixture only. No session capture or file output.
+check_cpu_text_frames: bool = false,
+check_gpu_text_frames: bool = false,

@@ -216,17 +216,21 @@ pub fn add(
     // POSIX C imports that are used throughout Ghostty on a general basis.
     // (note: errno is C stdlib but we just include it here because that's
     // where it's generally included otherwise)
-    try translate_c.addImportToModule(b, "posix_c", step.root_module, .{
-        .source = .{ .includes = .{ .files = &.{
-            .{ .path = "errno.h" },
-            .{ .path = "pwd.h" },
-            .{ .path = "signal.h" },
-            .{ .path = "sys/types.h" },
-            .{ .path = "unistd.h" },
-        } } },
-        .target = target,
-        .optimize = optimize,
-    });
+    // Windows uses native bindings instead; translating this module there
+    // would require POSIX-only headers such as pwd.h and unistd.h.
+    if (target.result.os.tag != .windows) {
+        try translate_c.addImportToModule(b, "posix_c", step.root_module, .{
+            .source = .{ .includes = .{ .files = &.{
+                .{ .path = "errno.h" },
+                .{ .path = "pwd.h" },
+                .{ .path = "signal.h" },
+                .{ .path = "sys/types.h" },
+                .{ .path = "unistd.h" },
+            } } },
+            .target = target,
+            .optimize = optimize,
+        });
+    }
 
     // Freetype. We always include this even if our font backend doesn't
     // use it because Dear Imgui uses Freetype.
@@ -604,7 +608,7 @@ pub fn add(
         .@"backend-osx" = target.result.os.tag == .macos,
         // OpenGL3 backend should only be built on non-Apple targets.
         // Apple platforms use Metal (and macOS may also use the OSX backend).
-        .@"backend-opengl3" = !target.result.os.tag.isDarwin(),
+        .@"backend-opengl3" = !target.result.os.tag.isDarwin() and !self.config.windows_remote_renderer,
     })) |dep| {
         step.root_module.addImport("dcimgui", dep.module("dcimgui"));
         step.root_module.linkLibrary(dep.artifact("dcimgui"));
@@ -655,12 +659,15 @@ pub fn add(
 
     // If we're building an exe then we have additional dependencies.
     if (step.kind != .lib) {
-        // We always statically compile glad
-        step.root_module.addIncludePath(b.path("vendor/glad/include/"));
-        step.root_module.addCSourceFile(.{
-            .file = b.path("vendor/glad/src/gl.c"),
-            .flags = &.{},
-        });
+        // The remote-only host must not link local GL/GLAD. The worker has its
+        // own explicit build target and graphics dependency graph.
+        if (!self.config.windows_remote_renderer) {
+            step.root_module.addIncludePath(b.path("vendor/glad/include/"));
+            step.root_module.addCSourceFile(.{
+                .file = b.path("vendor/glad/src/gl.c"),
+                .flags = &.{},
+            });
+        }
 
         // Link EGL for GTK.
         if (self.config.app_runtime == .gtk) {
@@ -691,6 +698,15 @@ pub fn add(
         switch (self.config.app_runtime) {
             .none => {},
             .gtk => try self.addGtk(step),
+            .win32 => {
+                if (target.result.os.tag != .windows) return error.Win32RuntimeRequiresWindows;
+                step.root_module.linkSystemLibrary("user32", .{});
+                step.root_module.linkSystemLibrary("gdi32", .{});
+                if (!self.config.windows_remote_renderer) step.root_module.linkSystemLibrary("opengl32", .{});
+                step.root_module.linkSystemLibrary("imm32", .{});
+                step.root_module.addCSourceFile(.{ .file = b.path("src/apprt/win32/diagnostics.c") });
+                step.root_module.addCSourceFile(.{ .file = b.path("src/render_worker_client.c"), .flags = &.{"-std=c11"} });
+            },
         }
     }
 

@@ -14,7 +14,7 @@ baseline ที่เสนอคือ **Data บน APFS ภายใน Mac, 
 - **source ปัจจุบัน:** โค้ด Windows ใน checkout นี้ ใช้หา requirement และจุดที่ต้องออกแบบใหม่ ไม่ใช่หลักฐานว่า macOS ทำงานแล้ว
 - **ข้อเสนอ/เงื่อนไขทดสอบ:** ยังไม่ได้ implement หรือรันบน M2 Pro จริง
 
-ไม่ได้อ่านบัญชี/keys ของผู้ใช้ ไม่เชื่อม Mac หรือ guest จริง ไม่เปลี่ยน filesystem/permissions และไม่เริ่ม port ในการสำรวจนี้ ชุดเผยแพร่ครั้งนี้เป็นเอกสารเตรียม Mac เท่านั้น ไม่รวม Windows development baseline ที่ยังไม่ได้ตกลงขอบเขตเผยแพร่
+ไม่ได้อ่านบัญชี/keys ของผู้ใช้ ไม่เชื่อม Mac หรือ guest จริง ไม่เปลี่ยน filesystem/permissions และไม่เริ่ม port ในการสำรวจนี้ branch ส่งมอบรวมเอกสารกับ Windows experimental development baseline สำหรับศึกษา/port ต่อ ไม่รวมข้อมูลบัญชี runtime ที่ดาวน์โหลดหรือ build caches และไม่ใช่หลักฐานว่า Mac implementation พร้อมแล้ว
 
 ## 1. ต้องนับข้อมูลมากกว่าดิสก์ VM
 

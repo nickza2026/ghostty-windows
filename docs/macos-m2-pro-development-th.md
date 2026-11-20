@@ -4,7 +4,7 @@
 
 ก่อนเริ่ม port ให้อ่าน [ข้อจำกัดและแผนรักษาข้อมูลบน M2 Pro](macos-m2-pro-data-constraints-th.md) ด้วย เป้าหมายเริ่มต้นคือ APFS ภายในเครื่องและพิสูจน์ backup/restore ก่อน USB portability
 
-ชุดเผยแพร่เอกสารนี้ยังไม่รวม Windows Sandbox development baseline ที่ค้างอยู่ใน checkout ต้นทาง การ clone branch นี้ได้ฐาน Ghostty macOS และคู่มือสำหรับเริ่ม build/วางแผน ไม่ใช่สำเนา custom Sandbox Windows ทั้งหมด ต้องตกลงขอบเขต source baseline แยกก่อนนำ implementation นั้นไป port
+branch `feat/windows-sandbox-baseline` รวม Windows Sandbox development baseline และคู่มือนี้เพื่อใช้ศึกษาหรือ port ต่อ โดยไม่รวม Data/accounts, downloaded runtimes หรือ build caches ส่วน Windows ยังมี experimental/default-off paths และ qualification gaps ตามเอกสาร ไม่ใช่การรับรอง production readiness หรือผลทดสอบ Mac
 
 ## 1. สิ่งที่จะได้ในแต่ละช่วง
 
@@ -55,7 +55,7 @@ M2 Pro ใน native session ควรแสดง `arm64` ถ้าเห็น
 ```sh
 mkdir -p "$HOME/Developer"
 cd "$HOME/Developer"
-git clone --branch docs/macbook-m2-pro-sandbox --single-branch \
+git clone --branch feat/windows-sandbox-baseline --single-branch \
   https://github.com/nickza2026/ghostty-windows.git
 cd ghostty-windows
 git status --short

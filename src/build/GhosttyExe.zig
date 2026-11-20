@@ -12,7 +12,7 @@ install_step: *std.Build.Step.InstallArtifact,
 
 pub fn init(b: *std.Build, cfg: *const Config, deps: *const SharedDeps) !Ghostty {
     const exe: *std.Build.Step.Compile = b.addExecutable(.{
-        .name = "ghostty",
+        .name = if (cfg.windows_sandbox_default) "Sandbox" else if (cfg.app_runtime == .win32) "localterm-dev" else "ghostty",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
             .target = cfg.target,
@@ -43,8 +43,12 @@ pub fn init(b: *std.Build, cfg: *const Config, deps: *const SharedDeps) !Ghostty
     switch (cfg.target.result.os.tag) {
         .windows => {
             exe.subsystem = .Windows;
+            // SharedDeps links the MSVC CRT. Zig exports its main wrapper when
+            // libc is linked; use the CRT's main startup, not WinMain startup.
+            // The subsystem stays GUI, and CRT initialization is preserved.
+            if (cfg.app_runtime == .win32) exe.entry = .{ .symbol_name = "mainCRTStartup" };
             exe.root_module.addWin32ResourceFile(.{
-                .file = b.path("dist/windows/ghostty.rc"),
+                .file = b.path(if (cfg.windows_sandbox_default) "dist/windows/sandbox.rc" else if (cfg.app_runtime == .win32) "dist/windows/localterm-dev.rc" else "dist/windows/ghostty.rc"),
             });
         },
 

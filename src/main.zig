@@ -36,3 +36,33 @@ test {
     _ = entrypoint;
     _ = @import("quirks_memset.zig");
 }
+
+// Keep this regression directly in the test root: app-runtime=none does not
+// otherwise instantiate Config's tests through the native entrypoint.
+test "sandbox manual clipboard shortcuts preserve interrupt and alternate bindings" {
+    if (@import("builtin").os.tag != .windows) return error.SkipZigTest;
+    const testing = std.testing;
+    const inputpkg = @import("input.zig");
+    var cfg = try @import("config/Config.zig").default(testing.allocator);
+    defer cfg.deinit();
+    const read_policy = cfg.@"clipboard-read";
+    const write_policy = cfg.@"clipboard-write";
+    try testing.expect(cfg.keybind.set.getEvent(.{ .action = .press, .key = .key_c, .mods = .{ .ctrl = true }, .unshifted_codepoint = 'c' }) == null);
+    try testing.expect(cfg.keybind.set.getEvent(.{ .action = .press, .key = .key_v, .mods = .{ .ctrl = true }, .unshifted_codepoint = 'v' }) == null);
+    try @import("apprt/win32/sandbox_clipboard.zig").apply(&cfg);
+    const copy = cfg.keybind.set.getEvent(.{ .action = .press, .key = .key_c, .mods = .{ .ctrl = true }, .unshifted_codepoint = 'c' });
+    try testing.expect(copy != null);
+    try testing.expect(copy.?.value_ptr.* == .leaf);
+    try testing.expect(copy.?.value_ptr.leaf.action == .copy_to_clipboard);
+    try testing.expect(copy.?.value_ptr.leaf.flags.performable);
+    const paste = cfg.keybind.set.getEvent(.{ .action = .press, .key = .key_v, .mods = .{ .ctrl = true }, .unshifted_codepoint = 'v' });
+    try testing.expect(paste != null);
+    try testing.expect(paste.?.value_ptr.leaf.action == .paste_from_clipboard);
+    try testing.expect(!paste.?.value_ptr.leaf.flags.performable);
+    try testing.expectEqual(.copy, cfg.@"right-click-action");
+    for ([_]inputpkg.Key{ .key_c, .key_v }) |key| {
+        try testing.expect(cfg.keybind.set.getEvent(.{ .action = .press, .key = key, .mods = .{ .ctrl = true, .shift = true }, .unshifted_codepoint = if (key == .key_c) 'c' else 'v' }) != null);
+    }
+    try testing.expectEqual(read_policy, cfg.@"clipboard-read");
+    try testing.expectEqual(write_policy, cfg.@"clipboard-write");
+}

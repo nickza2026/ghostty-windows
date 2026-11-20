@@ -337,12 +337,34 @@ const WindowsPty = struct {
     in_pipe_pty: windows.HANDLE,
     pseudo_console: windows.HPCON,
     size: winsize,
+    backend: @import("conpty_windows.zig").Backend,
 
     pub const OpenError = error{Unexpected};
+
+    extern "kernel32" fn GetEnvironmentVariableW([*:0]const u16, [*]u16, u32) callconv(.winapi) u32;
+
+    // Controlled diagnostic only. Values are defined by Microsoft's
+    // src/winconpty/winconpty.h (GLYPH_WIDTH mask), not guessed flags.
+    // No production selection, DLL loading, fallback, or OS settings change.
+    fn diagnosticWidthFlags() u32 {
+        var value: [32]u16 = undefined;
+        const enabled = GetEnvironmentVariableW(std.unicode.utf8ToUtf16LeStringLiteral("LOCALTERM_THAI_TUI_SMOKE"), &value, value.len);
+        if (enabled != 1 or value[0] != '1') return 0;
+        const n = GetEnvironmentVariableW(std.unicode.utf8ToUtf16LeStringLiteral("LOCALTERM_CONPTY_WIDTH"), &value, value.len);
+        if (n == 0 or n >= value.len) return 0;
+        if (std.mem.eql(u16, value[0..n], std.unicode.utf8ToUtf16LeStringLiteral("wcswidth"))) return 0x10;
+        if (std.mem.eql(u16, value[0..n], std.unicode.utf8ToUtf16LeStringLiteral("graphemes"))) return 0x08;
+        return 0;
+    }
 
     /// Open a new PTY with the given initial size.
     pub fn open(size: winsize) OpenError!Pty {
         var pty: Pty = undefined;
+        pty.backend = @import("conpty_windows.zig").Backend.init() catch |err| {
+            log.err("ConPTY provider initialization failed: {}", .{err});
+            return error.Unexpected;
+        };
+        errdefer pty.backend.deinit();
 
         var pipe_path_buf: [128]u8 = undefined;
         var pipe_path_buf_w: [128]u16 = undefined;
@@ -440,13 +462,15 @@ const WindowsPty = struct {
         try SetHandleInformation.f(pty.out_pipe);
         try SetHandleInformation.f(pty.out_pipe_pty);
 
-        const result = windows.exp.kernel32.CreatePseudoConsole(
+        const diagnostic_flags = diagnosticWidthFlags();
+        const result = pty.backend.create(
             .{ .X = @intCast(size.ws_col), .Y = @intCast(size.ws_row) },
             pty.in_pipe_pty,
             pty.out_pipe_pty,
-            0,
+            diagnostic_flags,
             &pty.pseudo_console,
         );
+        if (diagnostic_flags != 0) log.info("ConPTY width diagnostic flags=0x{x} HRESULT=0x{x}; no production default change", .{ diagnostic_flags, @as(u32, @bitCast(result)) });
         if (result != windows.S_OK) return error.Unexpected;
 
         pty.size = size;
@@ -458,7 +482,8 @@ const WindowsPty = struct {
         _ = windows.exp.kernel32.CloseHandle(self.in_pipe);
         _ = windows.exp.kernel32.CloseHandle(self.out_pipe_pty);
         _ = windows.exp.kernel32.CloseHandle(self.out_pipe);
-        _ = windows.exp.kernel32.ClosePseudoConsole(self.pseudo_console);
+        self.backend.close(self.pseudo_console);
+        self.backend.deinit();
         self.* = undefined;
     }
 
@@ -473,7 +498,7 @@ const WindowsPty = struct {
 
     /// Set the size of the pty.
     pub fn setSize(self: *Pty, size: winsize) SetSizeError!void {
-        const result = windows.exp.kernel32.ResizePseudoConsole(
+        const result = self.backend.resize(
             self.pseudo_console,
             .{ .X = @intCast(size.ws_col), .Y = @intCast(size.ws_row) },
         );

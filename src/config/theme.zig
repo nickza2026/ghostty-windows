@@ -28,6 +28,10 @@ pub const Location = enum {
         defer environ_map.deinit();
         return switch (self) {
             .user => user: {
+                if (global.portablePaths()) |layout| {
+                    layout.verify(global.io()) catch return error.Unexpected;
+                    break :user try std.fs.path.join(arena_alloc, &.{ layout.root, "config", "themes" });
+                }
                 const subdir = std.fs.path.join(arena_alloc, &.{
                     "ghostty", "themes",
                 }) catch return error.OutOfMemory;

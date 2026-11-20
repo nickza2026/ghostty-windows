@@ -1077,6 +1077,72 @@ test "shape Combining characters" {
 // This test exists because the string it uses causes HarfBuzz to output a
 // non-monotonic run with our cluster level set to `characters`, which we need
 // to handle by tracking the max cluster for the run.
+test "windows Thai stacked mark clusters" {
+    if (font.options.backend != .freetype_windows) return error.SkipZigTest;
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const font_sets = [_][]const [:0]const u8{
+        &.{"Leelawadee UI"},
+        &.{ "Consolas", "Leelawadee UI" },
+    };
+    for (font_sets) |families| for ([_]bool{ false, true }) |native_hinting| for ([_]i32{ 0, 4 }) |row_delta| {
+        const native_flags: font.face.FreetypeLoadFlags = if (comptime font.options.backend.hasFreetype()) .{ .light = false, .autohint = false } else {};
+        var data = try testShaperWithDiscoveredFontOptions(alloc, families, .{
+            .size = .{ .points = 12 },
+            .freetype_load_flags = if (native_hinting) native_flags else font.face.freetype_load_flags_default,
+        }, row_delta);
+        defer data.deinit();
+        if (families.len == 2) try testing.expectEqual(@as(u32, 9), data.grid.metrics.cell_width);
+        if (families.len == 2 and row_delta == 4) try testing.expectEqual(@as(u32, 23), data.grid.metrics.cell_height);
+        for ([_]bool{ false, true }) |cluster_mode| {
+            var t = try terminal.Terminal.init(testing.io, alloc, .{ .cols = 8, .rows = 2 });
+            defer t.deinit(alloc);
+            t.modes.set(.grapheme_cluster, cluster_mode);
+            var stream = t.vtStream();
+            defer stream.deinit();
+            stream.nextSlice("กี้");
+            var state: terminal.RenderState = .empty;
+            defer state.deinit(alloc);
+            try state.update(alloc, &t);
+            var it = data.shaper.runIterator(.{
+                .grid = data.grid,
+                .cells = state.row_data.get(0).cells.slice(),
+            });
+            const run = (try it.next(alloc)) orelse return error.MissingThaiRun;
+            const cells = try data.shaper.shape(run);
+            try testing.expect(cells.len >= 2);
+            for (cells) |cell| {
+                try testing.expect(cell.glyph_index != 0);
+                try testing.expectEqual(@as(u16, 0), cell.x);
+                std.debug.print("Thai stacked marks native_hinting={} grapheme={} gid={} cell={} offset=({},{})\n", .{
+                    native_hinting, cluster_mode, cell.glyph_index, cell.x, cell.x_offset, cell.y_offset,
+                });
+                const rendered = try data.grid.renderGlyph(alloc, run.font_index, cell.glyph_index, .{
+                    .grid_metrics = data.grid.metrics,
+                    .cell_width = 1,
+                });
+                if (row_delta == 4) {
+                    const top_from_bottom = @as(i64, rendered.glyph.offset_y) + cell.y_offset;
+                    try testing.expect(top_from_bottom <= data.grid.metrics.cell_height);
+                    try testing.expect(top_from_bottom - rendered.glyph.height >= 0);
+                }
+                std.debug.print("Thai glyph ink gid={} bearing=({},{}) final=({},{}) bitmap={}x{} grid={}x{}\n", .{
+                    cell.glyph_index,
+                    rendered.glyph.offset_x,
+                    rendered.glyph.offset_y,
+                    rendered.glyph.offset_x + cell.x_offset,
+                    rendered.glyph.offset_y + cell.y_offset,
+                    rendered.glyph.width,
+                    rendered.glyph.height,
+                    data.grid.metrics.cell_width,
+                    data.grid.metrics.cell_height,
+                });
+            }
+            try testing.expect(try it.next(alloc) == null);
+        }
+    };
+}
+
 test "shape Devanagari string" {
     const testing = std.testing;
     const alloc = testing.allocator;
@@ -2076,11 +2142,13 @@ const TestShaper = struct {
     shaper: Shaper,
     grid: *SharedGrid,
     lib: Library,
+    metric_modifiers: font.Metrics.ModifierSet = .{},
 
     pub fn deinit(self: *TestShaper) void {
         self.shaper.deinit();
         self.grid.deinit(self.alloc);
         self.alloc.destroy(self.grid);
+        self.metric_modifiers.deinit(self.alloc);
         self.lib.deinit();
     }
 };
@@ -2181,15 +2249,28 @@ fn testShaperWithFont(alloc: Allocator, font_req: TestFont) !TestShaper {
 }
 
 fn testShaperWithDiscoveredFont(alloc: Allocator, font_req: [:0]const u8) !TestShaper {
+    return testShaperWithDiscoveredFonts(alloc, &.{font_req});
+}
+
+fn testShaperWithDiscoveredFonts(alloc: Allocator, font_reqs: []const [:0]const u8) !TestShaper {
+    return testShaperWithDiscoveredFontOptions(alloc, font_reqs, .{ .size = .{ .points = 12 } }, 0);
+}
+
+fn testShaperWithDiscoveredFontOptions(alloc: Allocator, font_reqs: []const [:0]const u8, options: font.face.Options, row_delta: i32) !TestShaper {
     if (font.Discover == void) return error.SkipZigTest;
     var lib = try Library.init(alloc);
     errdefer lib.deinit();
 
-    var c = Collection.init();
-    c.load_options = .{ .library = lib };
+    var metric_modifiers: font.Metrics.ModifierSet = .{};
+    errdefer metric_modifiers.deinit(alloc);
+    if (row_delta != 0) try metric_modifiers.put(alloc, .cell_height, .{ .absolute = row_delta });
 
-    // Discover and add our font to the collection.
-    {
+    var c = Collection.init();
+    c.metric_modifiers = metric_modifiers;
+    c.load_options = .{ .library = lib, .freetype_load_flags = options.freetype_load_flags };
+
+    // Discover and add fonts in priority order, primary first.
+    for (font_reqs) |font_req| {
         var disco = font.Discover.init(lib);
         defer disco.deinit();
         var disco_it = try disco.discover(alloc, .{
@@ -2199,18 +2280,22 @@ fn testShaperWithDiscoveredFont(alloc: Allocator, font_req: [:0]const u8) !TestS
         });
         defer disco_it.deinit();
         var face: font.DeferredFace = (try disco_it.next()) orelse return error.FontNotFound;
-        errdefer face.deinit();
+        // load() creates an independent face. Release discovery's metadata
+        // face/path on success too (Windows owns allocations in both).
+        defer face.deinit();
 
         // Check which font was discovered - skip if it doesn't match the request
         var name_buf: [256]u8 = undefined;
         const face_name = face.name(&name_buf) catch "(unknown)";
-        if (std.mem.indexOf(u8, face_name, font_req) == null) {
+        // Windows discovery already requires exact family matching. Its SFNT
+        // display name can be UTF-16BE, so don't compare that with UTF-8 here.
+        if (font.options.backend != .freetype_windows and std.mem.indexOf(u8, face_name, font_req) == null) {
             return error.SkipZigTest;
         }
 
         _ = try c.add(
             alloc,
-            try face.load(lib, .{ .size = .{ .points = 12 } }),
+            try face.load(lib, options),
             .{
                 .style = .regular,
                 .fallback = false,
@@ -2232,5 +2317,6 @@ fn testShaperWithDiscoveredFont(alloc: Allocator, font_req: [:0]const u8) !TestS
         .shaper = shaper,
         .grid = grid_ptr,
         .lib = lib,
+        .metric_modifiers = metric_modifiers,
     };
 }

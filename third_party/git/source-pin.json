@@ -1,0 +1,16 @@
+{
+  "version": "2.56.0.windows.4",
+  "tag": "v2.56.0.windows.4",
+  "url": "https://github.com/git-for-windows/git/releases/download/v2.56.0.windows.4/PortableGit-2.56.0.4-64-bit.7z.exe",
+  "sha256": "b1f3e52216e2ed6882d1bebfd4d3fdf319bec40d2edbbf9fd26ec4fd3fce7ed1",
+  "size": 60087472,
+  "format": "7z-sfx",
+  "digestSource": "Official GitHub release asset API digest (sha256)",
+  "extractor": {
+    "version": "26.05",
+    "url": "https://github.com/ip7z/7zip/releases/download/26.05/7zr.exe",
+    "size": 602624,
+    "sha256": "9bf582b894dfa665f852d7e9112b02290a1c303c2d95a21fcdc41ffcb03143b7",
+    "license": "7zr standalone: public domain"
+  }
+}

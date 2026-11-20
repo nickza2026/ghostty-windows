@@ -27,6 +27,11 @@ pub fn defaultPath(
     alloc: Allocator,
     program: []const u8,
 ) ![]const u8 {
+    if (global.portablePaths()) |layout| {
+        try layout.verify(global.io());
+        if (program.len == 0 or std.mem.eql(u8, program, ".") or std.mem.eql(u8, program, "..") or std.mem.indexOfAny(u8, program, "\\/:") != null or !std.mem.eql(u8, std.fs.path.basename(program), program)) return error.InvalidPortableCacheName;
+        return std.fs.path.join(alloc, &.{ layout.root, "data", program, "ssh_cache" });
+    }
     var environ_map = try global.environMap();
     defer environ_map.deinit();
     const state_dir: []const u8 = xdg.state(

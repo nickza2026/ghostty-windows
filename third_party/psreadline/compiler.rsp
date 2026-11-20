@@ -1,0 +1,6 @@
+/nostdlib+
+/target:library
+/langversion:7.3
+/optimize+
+/deterministic+
+/debug:portable

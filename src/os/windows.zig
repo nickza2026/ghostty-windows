@@ -161,6 +161,9 @@ pub const exp = struct {
             dwFlags: DWORD,
             lpSize: *SIZE_T,
         ) callconv(.winapi) BOOL;
+        pub extern "kernel32" fn DeleteProcThreadAttributeList(
+            lpAttributeList: LPPROC_THREAD_ATTRIBUTE_LIST,
+        ) callconv(.winapi) void;
         pub extern "kernel32" fn UpdateProcThreadAttribute(
             lpAttributeList: LPPROC_THREAD_ATTRIBUTE_LIST,
             dwFlags: DWORD,
@@ -265,6 +268,13 @@ pub const exp = struct {
             lpBuffer: LPVOID,
             nNumberOfBytesToRead: DWORD,
             lpNumberOfBytesRead: ?*DWORD,
+            lpOverlapped: ?*OVERLAPPED,
+        ) callconv(.winapi) BOOL;
+        pub extern "kernel32" fn WriteFile(
+            hFile: HANDLE,
+            lpBuffer: *const anyopaque,
+            nNumberOfBytesToWrite: DWORD,
+            lpNumberOfBytesWritten: *DWORD,
             lpOverlapped: ?*OVERLAPPED,
         ) callconv(.winapi) BOOL;
         /// https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-getfinalpathnamebyhandlew

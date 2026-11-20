@@ -10,6 +10,9 @@ const GraphicsAPI = Renderer.API;
 const Texture = GraphicsAPI.Texture;
 const CellSize = @import("size.zig").CellSize;
 const Overlay = @import("Overlay.zig");
+const CpuImageSnapshot = @import("remote/ImageSnapshot.zig");
+const CpuImageResource = @import("remote/ImageResource.zig");
+const CpuImagePlacement = @import("remote/ImagePlacement.zig");
 
 const log = std.log.scoped(.renderer_image);
 
@@ -54,6 +57,59 @@ pub const State = struct {
         }
         self.kitty_placements.deinit(alloc);
         self.overlay_placements.deinit(alloc);
+    }
+
+    /// Opt-in remote adapter, not used by legacy upload/draw. Caller holds the
+    /// renderer draw lock and uses this State's allocator. Retain pending CPU
+    /// pixels across ACKs: a stale viewport drop must not lose resource data.
+    /// Never transition to a counterfeit .ready/local GPU texture.
+    pub fn captureCpuSnapshot(self: *State, alloc: Allocator, cell_size: [2]f32, limits: CpuImageSnapshot.Limits) !CpuImageResource.Owned {
+        try CpuImageSnapshot.validateLimits(limits, cell_size);
+        if (self.overlay_placements.items.len != 0) return error.UnsupportedCpuImageOverlay;
+        var iterator = self.images.iterator();
+        while (iterator.next()) |entry| {
+            if (entry.key_ptr.* != .kitty) return error.UnsupportedCpuImageOverlay;
+            switch (entry.value_ptr.image) {
+                .pending, .unload_pending => {},
+                else => return error.NonCpuImageState,
+            }
+        }
+        // Same removeByPtr iteration pattern as upload(), but only proven CPU
+        // unload_pending states can reach here; never call a GPU destructor.
+        iterator = self.images.iterator();
+        while (iterator.next()) |entry| {
+            if (entry.value_ptr.image == .unload_pending) {
+                entry.value_ptr.image.deinit(alloc);
+                self.images.removeByPtr(entry.key_ptr);
+            }
+        }
+        if (self.images.count() > limits.images or self.kitty_placements.items.len > limits.placements) return error.SnapshotCountExceeded;
+        const images = try alloc.alloc(CpuImageResource.Input, self.images.count());
+        defer alloc.free(images);
+        const placements = try alloc.alloc(CpuImagePlacement, self.kitty_placements.items.len);
+        defer alloc.free(placements);
+        iterator = self.images.iterator();
+        var index: usize = 0;
+        while (iterator.next()) |entry| : (index += 1) {
+            const pending = entry.value_ptr.image.pending;
+            if (pending.pixel_format != .rgba) return error.UnsupportedCpuImageFormat;
+            // Guard Pending.len()'s u32 arithmetic before taking a pixel slice.
+            if (pending.width == 0 or pending.height == 0 or pending.width > limits.dimension or pending.height > limits.dimension) return error.InvalidDimensions;
+            if (@as(u64, pending.width) * pending.height * 4 + CpuImageResource.header_bytes > limits.bytes) return error.ImageBudgetExceeded;
+            images[index] = .{ .id = entry.key_ptr.kitty, .generation = entry.value_ptr.generation, .width = pending.width, .height = pending.height, .rgba = pending.dataSlice() };
+            _ = try CpuImageResource.encodedLength(images[index], .{ .dimension = limits.dimension, .bytes = limits.bytes });
+        }
+        std.mem.sortUnstable(CpuImageResource.Input, images, {}, struct {
+            fn less(_: void, a: CpuImageResource.Input, b: CpuImageResource.Input) bool {
+                return a.id < b.id;
+            }
+        }.less);
+        for (self.kitty_placements.items, placements) |p, *out| {
+            if (p.image_id != .kitty) return error.UnsupportedCpuImageOverlay;
+            const entry = self.images.get(p.image_id) orelse return error.MissingImageResource;
+            out.* = .{ .image_id = p.image_id.kitty, .generation = entry.generation, .x = p.x, .y = p.y, .z = p.z, .width = p.width, .height = p.height, .cell_offset_x = p.cell_offset_x, .cell_offset_y = p.cell_offset_y, .source_x = p.source_x, .source_y = p.source_y, .source_width = p.source_width, .source_height = p.source_height };
+        }
+        return CpuImageSnapshot.encodeAlloc(alloc, .{ .images = images, .placements = placements, .cell_size = cell_size }, limits);
     }
 
     /// Upload any images to the GPU that need to be uploaded,
@@ -1152,6 +1208,59 @@ pub const Image = union(enum) {
     }
 };
 
+fn cpuSnapshotFixture(alloc: Allocator) !State {
+    var state: State = .empty;
+    errdefer state.deinit(alloc);
+    const pixels = try alloc.dupe(u8, &.{ 255, 0, 0, 255 });
+    state.images.put(alloc, .{ .kitty = 7 }, .{ .generation = 3, .image = .{ .pending = .{ .width = 1, .height = 1, .pixel_format = .rgba, .data = pixels.ptr } } }) catch |err| {
+        alloc.free(pixels);
+        return err;
+    };
+    try state.kitty_placements.append(alloc, .{ .image_id = .{ .kitty = 7 }, .x = -1, .y = 0, .z = -1, .width = 4, .height = 4, .cell_offset_x = 0, .cell_offset_y = 0, .source_x = 0, .source_y = 0, .source_width = 1, .source_height = 1 });
+    return state;
+}
+test "CPU image snapshot retains pending ownership and prunes CPU unloads" {
+    const alloc = std.testing.allocator;
+    var state = try cpuSnapshotFixture(alloc);
+    defer state.deinit(alloc);
+    var owned = try state.captureCpuSnapshot(alloc, .{ 4, 4 }, .{});
+    defer owned.deinit();
+    const view = try CpuImageSnapshot.decode(owned.bytes, .{});
+    try std.testing.expectEqual(@as(i32, -1), (try view.placement(0)).x);
+    const entry = state.images.getPtr(.{ .kitty = 7 }).?;
+    try std.testing.expect(entry.image == .pending);
+    entry.image.pending.data[0] = 0;
+    try std.testing.expectEqual(@as(u8, 255), (try view.image(0)).rgba[0]);
+    entry.image.markForUnload();
+    state.kitty_placements.clearRetainingCapacity();
+    var empty = try state.captureCpuSnapshot(alloc, .{ 4, 4 }, .{});
+    defer empty.deinit();
+    try std.testing.expectEqual(@as(u32, 0), (try CpuImageSnapshot.decode(empty.bytes, .{})).image_count);
+    try std.testing.expectEqual(@as(u32, 0), state.images.count());
+}
+test "CPU image snapshot rejects local GPU states without destroying them" {
+    const alloc = std.testing.allocator;
+    var state = try cpuSnapshotFixture(alloc);
+    defer state.deinit(alloc);
+    const entry = state.images.getPtr(.{ .kitty = 7 }).?;
+    const original = entry.image;
+    // Guard test only: undefined sentinel is never read or destroyed, and is
+    // restored BEFORE State.deinit. Production must never fabricate .ready.
+    entry.image = .{ .ready = undefined };
+    defer entry.image = original;
+    try std.testing.expectError(error.NonCpuImageState, state.captureCpuSnapshot(alloc, .{ 4, 4 }, .{}));
+}
+fn cpuSnapshotAllocationCase(alloc: Allocator) !void {
+    var state = try cpuSnapshotFixture(alloc);
+    defer state.deinit(alloc);
+    var owned = try state.captureCpuSnapshot(alloc, .{ 4, 4 }, .{});
+    defer owned.deinit();
+    _ = try CpuImageSnapshot.decode(owned.bytes, .{});
+}
+test "CPU image snapshot cleans metadata and packet allocation failures" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, cpuSnapshotAllocationCase, .{});
+}
+
 test "kitty renderer ignores pending payloads and removes replaced placements" {
     const testing = std.testing;
     const alloc = testing.allocator;
@@ -1196,6 +1305,18 @@ test "kitty renderer ignores pending payloads and removes replaced placements" {
         pending.generation,
         state.images.get(.{ .kitty = 1 }).?.generation,
     );
+
+    // Capture the real Kitty renderer's converted CPU-owned pending image,
+    // without upload()/local GPU objects or a fabricated .ready transition.
+    {
+        var snapshot = try state.captureCpuSnapshot(alloc, .{ 10, 10 }, .{});
+        defer snapshot.deinit();
+        const view = try CpuImageSnapshot.decode(snapshot.bytes, .{});
+        try testing.expectEqual(@as(u32, 1), view.image_count);
+        try testing.expectEqual(pending.generation, (try view.image(0)).generation);
+        try testing.expectEqualSlices(u8, "rgba", (try view.image(0)).rgba);
+        try testing.expect(state.images.get(.{ .kitty = 1 }).?.image == .pending);
+    }
 
     // A newer pending replacement deletes the native placement and marks the
     // copied texture data for unload.

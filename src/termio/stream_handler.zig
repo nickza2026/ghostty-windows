@@ -16,6 +16,38 @@ const posix = std.posix;
 
 const log = std.log.scoped(.io_handler);
 
+test "renderer wakeup borrows instance before waiter registration" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    var loop = try xev.Loop.init(.{});
+    defer loop.deinit();
+    var wakeup = try xev.Async.init();
+    defer wakeup.deinit();
+    // Match Surface.init: configure termio before renderer waiter registration.
+    // A by-value copy here retains a null IOCP waiter forever.
+    var handler: StreamHandler = undefined;
+    handler.renderer_wakeup = &wakeup;
+    var detached = wakeup; // Counterfactual old value-copy, before registration.
+    var completion: xev.Completion = .{};
+    var called = false;
+    wakeup.wait(&loop, &completion, bool, &called, struct {
+        fn callback(value: ?*bool, _: *xev.Loop, _: *xev.Completion, result: xev.Async.WaitError!void) xev.CallbackAction {
+            result catch return .disarm;
+            value.?.* = true;
+            return .disarm;
+        }
+    }.callback);
+    try detached.notify();
+    try loop.run(.no_wait);
+    try std.testing.expect(!called); // Prove that the old copy loses this wake.
+    try handler.queueRender();
+    // Nonblocking dispatch: lost wake fails without a cursor timer or a hang.
+    for (0..2) |_| {
+        try loop.run(.no_wait);
+        if (called) break;
+    }
+    try std.testing.expect(called);
+}
+
 /// This is used as the handler for the terminal.Stream type. This is
 /// stateful and is expected to live for the entire lifetime of the terminal.
 /// It is NOT VALID to stop a stream handler, create a new one, and use that
@@ -37,9 +69,9 @@ pub const StreamHandler = struct {
     /// The mailbox for notifying the renderer of things.
     renderer_mailbox: *renderer.Thread.Mailbox,
 
-    /// A handle to wake up the renderer. This hints to the renderer that
-    /// a repaint should happen.
-    renderer_wakeup: xev.Async,
+    /// Borrow the same Async object that the renderer registers with its loop.
+    /// IOCP Async has inline state and is not a copyable descriptor handle.
+    renderer_wakeup: *xev.Async,
 
     /// The response to use for ENQ requests. The memory is owned by
     /// whoever owns StreamHandler.
