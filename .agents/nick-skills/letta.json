@@ -1,0 +1,115 @@
+{
+  "schemaVersion": 1,
+  "harness": "letta",
+  "preset": "balanced",
+  "models": {
+    "scout": "inherit",
+    "implementer": "inherit",
+    "verifier": "inherit",
+    "advisor": "gpt-6-astra-high",
+    "git-publisher": "inherit",
+    "db-reviewer": "inherit",
+    "security-reviewer": "inherit"
+  },
+  "policy": {
+    "maxParallel": 2,
+    "maxDelegationDepth": 1,
+    "writerOwnership": "one-per-file",
+    "publication": "explicit-task-authorization"
+  },
+  "permissionCaveat": "Explicit native tool allowlists cover default and Codex toolsets. Shell-capable read/check roles are instruction-constrained, not read-only filesystem sandboxes. No Agent/Task delegation tool is granted; shell spawning of another AI is also forbidden by the role contract.",
+  "source": {
+    "kind": "github",
+    "repository": "nickza2026/nick-skills",
+    "ref": "7967e6f7112a97cbf2262ea50665a9ba2739d3ca",
+    "baseUrl": "https://raw.githubusercontent.com/nickza2026/nick-skills/7967e6f7112a97cbf2262ea50665a9ba2739d3ca"
+  },
+  "remoteAvailability": "not-checked",
+  "rendererSnapshotMatch": "not-checked",
+  "nativeVerification": "pending",
+  "managedFiles": [
+    {
+      "path": ".letta/agents/nick-scout.md",
+      "contentHash": "c33963d05f15286321e0265649a93058869a6bc8200d4fe1337bdeb51e2484f8"
+    },
+    {
+      "path": ".letta/agents/nick-implementer.md",
+      "contentHash": "509fc2f2077e7832f5f3d6b1a77d0d2d79968e928cdfaa0d25ef08e186980b2a"
+    },
+    {
+      "path": ".letta/agents/nick-verifier.md",
+      "contentHash": "4c947a6fb4d8bcd8475249ea1ab7334b6010fae2adeb34a98ae1e061f2cd963d"
+    },
+    {
+      "path": ".letta/agents/nick-advisor.md",
+      "contentHash": "a872e3df301036971b43f20b4f6fb06c66b7b4a58403b3b0094c1bf513cc1cf2"
+    },
+    {
+      "path": ".letta/agents/nick-git-publisher.md",
+      "contentHash": "577fef72b86dfb3415f227f62910b817fad28f22d3c83751689481591f4c2774"
+    },
+    {
+      "path": ".letta/agents/nick-db-reviewer.md",
+      "contentHash": "1a464df1d2ca00eab6793bc4227314f1d2b6a8b87b28fe0dff1e0970c541205c"
+    },
+    {
+      "path": ".letta/agents/nick-security-reviewer.md",
+      "contentHash": "2d68fa6f126a9387fb116044dc9773cfb51107480a68b95dce21ba2bf9beda6a"
+    },
+    {
+      "path": "AGENTS.md",
+      "contentHash": "fa7d61cbfe5aaaa0c9ba6434e53ae4dd3e9f6ee801ff1b96e0ab1469cc89de26"
+    }
+  ],
+  "advisorInvocationPolicy": {
+    "scope": "parent Agent tool call; not an automatically applied native setting",
+    "requiresExplicitModelArgument": true,
+    "model": "gpt-6-astra-high",
+    "verifiedHandle": "openai-codex/gpt-6-astra",
+    "verifiedReasoningEffort": "high",
+    "implicitModelRouting": "mismatch observed on Letta 0.34.23; unresolved",
+    "inheritanceCaveat": "Inheriting a model handle does not guarantee inheriting the parent's reasoning effort."
+  },
+  "toolsetAdaptation": {
+    "id": "letta-0.34.20-default-codex-v1",
+    "toolsByAccess": {
+      "read": [
+        "Glob",
+        "Grep",
+        "Read",
+        "exec_command"
+      ],
+      "write": [
+        "Glob",
+        "Grep",
+        "Read",
+        "Edit",
+        "Write",
+        "Bash",
+        "exec_command",
+        "write_stdin",
+        "ApplyPatch",
+        "Skill"
+      ],
+      "verify": [
+        "Glob",
+        "Grep",
+        "Read",
+        "Bash",
+        "exec_command",
+        "write_stdin",
+        "Skill"
+      ],
+      "publish": [
+        "Glob",
+        "Grep",
+        "Read",
+        "Bash",
+        "exec_command",
+        "write_stdin",
+        "Skill"
+      ]
+    },
+    "nativeVerificationEvidence": ".agents/nick-skills/native-checks.json"
+  }
+}

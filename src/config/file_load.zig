@@ -10,6 +10,10 @@ const log = std.log.scoped(.config);
 /// Default path for the XDG home configuration file. Returned value
 /// must be freed by the caller.
 pub fn defaultXdgPath(alloc: Allocator) ![]const u8 {
+    if (global.portablePaths()) |layout| {
+        try layout.verify(global.io());
+        return layout.configFile(alloc);
+    }
     var environ_map = try global.environMap();
     defer environ_map.deinit();
     return try internal_os.xdg.config(
@@ -23,6 +27,10 @@ pub fn defaultXdgPath(alloc: Allocator) ![]const u8 {
 /// Ghostty <1.3.0 default path for the XDG home configuration file.
 /// Returned value must be freed by the caller.
 pub fn legacyDefaultXdgPath(alloc: Allocator) ![]const u8 {
+    if (global.portablePaths()) |layout| {
+        try layout.verify(global.io());
+        return std.fs.path.join(alloc, &.{ layout.root, "config", "config" });
+    }
     var environ_map = try global.environMap();
     defer environ_map.deinit();
     return try internal_os.xdg.config(

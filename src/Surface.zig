@@ -529,6 +529,7 @@ pub fn init(
         &derived_config.font,
         font_size,
     );
+    errdefer if (comptime builtin.os.tag == .windows) app.font_grid_set.deref(font_grid_key);
 
     // Build our size struct which has all the sizes we need.
     const size: rendererpkg.Size = size: {
@@ -576,8 +577,17 @@ pub fn init(
         .surface_mailbox = .{ .surface = self, .app = app_mailbox },
         .rt_surface = rt_surface,
         .thread = &self.renderer_thread,
+        .check_cpu_text_frames = if (comptime builtin.os.tag == .windows and @hasDecl(apprt.Surface, "wantsCpuTextFrameChecks"))
+            rt_surface.wantsCpuTextFrameChecks()
+        else
+            false,
+        .check_gpu_text_frames = if (comptime builtin.os.tag == .windows and @hasDecl(apprt.Surface, "wantsGpuTextFrameChecks"))
+            rt_surface.wantsGpuTextFrameChecks()
+        else
+            false,
     });
-    errdefer renderer_impl.deinit();
+    var owners_transferred = false;
+    errdefer if (!owners_transferred) renderer_impl.deinit();
 
     // The mutex used to protect our renderer state.
     const mutex = try alloc.create(std.Io.Mutex);
@@ -592,11 +602,11 @@ pub fn init(
         &self.renderer,
         &self.renderer_state,
     );
-    errdefer render_thread.deinit();
+    errdefer if (!owners_transferred) render_thread.deinit();
 
     // Create the IO thread
     var io_thread = try termio.Thread.init(alloc);
-    errdefer io_thread.deinit();
+    errdefer if (!owners_transferred) io_thread.deinit();
 
     self.* = .{
         .id = id: {
@@ -636,6 +646,16 @@ pub fn init(
         // Our conditional state is initialized to the app state. This
         // lets us get the most likely correct color theme and so on.
         .config_conditional_state = app.config_conditional_state,
+    };
+    owners_transferred = builtin.os.tag == .windows;
+    var io_initialized = false;
+    errdefer if (comptime builtin.os.tag == .windows) {
+        // Workers mutate these owners after transfer; temporary copies are
+        // stale. Match normal teardown order after rollback has joined them.
+        self.renderer.deinit();
+        self.renderer_thread.deinit();
+        self.io_thread.deinit();
+        if (io_initialized) self.io.deinit();
     };
 
     // The command we're going to execute
@@ -695,14 +715,15 @@ pub fn init(
             .backend = .{ .exec = io_exec },
             .mailbox = io_mailbox,
             .renderer_state = &self.renderer_state,
-            .renderer_wakeup = render_thread.wakeup,
+            .renderer_wakeup = &self.renderer_thread.wakeup,
             .renderer_mailbox = render_thread.mailbox,
             .surface_mailbox = .{ .surface = self, .app = app_mailbox },
         });
     }
     // Outside the block, IO has now taken ownership of our temporary state
     // so we can just defer this and not the subcomponents.
-    errdefer self.io.deinit();
+    io_initialized = true;
+    errdefer if (comptime builtin.os.tag != .windows) self.io.deinit();
 
     // Report initial cell size on surface creation
     _ = try rt_app.performAction(
@@ -730,21 +751,13 @@ pub fn init(
     // to duplicate.
     try self.resize(self.size.screen);
 
-    // Start our renderer thread
-    self.renderer_thr = try std.Thread.spawn(
-        .{},
-        rendererpkg.Thread.threadMain,
-        .{&self.renderer_thread},
-    );
-    self.renderer_thr.setName(global.io(), "renderer") catch {};
-
-    // Start our IO thread
-    self.io_thr = try std.Thread.spawn(
-        .{},
-        termio.Thread.threadMain,
-        .{ &self.io_thread, &self.io },
-    );
-    self.io_thr.setName(global.io(), "io") catch {};
+    if (comptime builtin.os.tag != .windows) {
+        // Preserve the existing startup path on other platforms.
+        self.renderer_thr = try std.Thread.spawn(.{}, rendererpkg.Thread.threadMain, .{&self.renderer_thread});
+        self.renderer_thr.setName(global.io(), "renderer") catch {};
+        self.io_thr = try std.Thread.spawn(.{}, termio.Thread.threadMain, .{ &self.io_thread, &self.io });
+        self.io_thr.setName(global.io(), "io") catch {};
+    }
 
     // Determine our initial window size if configured. We need to do this
     // quite late in the process because our height/width are in grid dimensions,
@@ -802,27 +815,64 @@ pub fn init(
         .shell => {},
     };
 
+    // Windows starts only after all fallible initial-title actions. A title
+    // error must not unwind dependencies underneath two live workers.
+    if (comptime builtin.os.tag == .windows) try self.startWindowsWorkers();
+
     // We are no longer the first surface
     app.first = false;
+}
+
+fn startWindowsWorkers(self: *Surface) !void {
+    const Startup = struct {
+        pub fn startRenderer(surface: *Surface) !void {
+            if (comptime @hasDecl(apprt.runtime.Surface, "failWorkerStartup")) {
+                if (surface.rt_surface.failWorkerStartup(false)) return error.ControlledRendererSpawnFailure;
+            }
+            surface.renderer_thr = try std.Thread.spawn(.{}, rendererpkg.Thread.threadMain, .{&surface.renderer_thread});
+            @import("os/windows_resource_ledger.zig").acquire(.renderer, surface.renderer_thr.getHandle());
+            surface.renderer_thr.setName(global.io(), "renderer") catch {};
+            if (comptime @hasDecl(apprt.runtime.Surface, "noteWorkerStarted")) surface.rt_surface.noteWorkerStarted(false);
+        }
+        pub fn startIo(surface: *Surface) !void {
+            if (comptime @hasDecl(apprt.runtime.Surface, "failWorkerStartup")) {
+                if (surface.rt_surface.failWorkerStartup(true)) return error.ControlledIoSpawnFailure;
+            }
+            surface.io_thr = try std.Thread.spawn(.{}, termio.Thread.threadMain, .{ &surface.io_thread, &surface.io });
+            @import("os/windows_resource_ledger.zig").acquire(.io, surface.io_thr.getHandle());
+            surface.io_thr.setName(global.io(), "io") catch {};
+            if (comptime @hasDecl(apprt.runtime.Surface, "noteWorkerStarted")) surface.rt_surface.noteWorkerStarted(true);
+        }
+        pub fn stopAndJoinRenderer(surface: *Surface) void {
+            if (comptime @hasDecl(apprt.runtime.Surface, "quarantineFailedStartup")) surface.rt_surface.quarantineFailedStartup();
+            surface.renderer_thread.stop.notify() catch |err|
+                log.err("error stopping renderer during failed worker startup err={}", .{err});
+            surface.joinRuntimeWorker(surface.renderer_thr);
+            log.info("Windows renderer joined before failed startup cleanup", .{});
+        }
+    };
+    try @import("termio/worker_startup.zig").start(Startup, self);
 }
 
 pub fn deinit(self: *Surface) void {
     // Stop search thread
     if (self.search) |*s| s.deinit();
 
+    // Windows' blocking ConPTY reader can still be producing renderer mailbox
+    // messages while the child is terminated. Keep that consumer alive until
+    // IO/reader shutdown joins; otherwise a full renderer mailbox deadlocks
+    // the reader and consequently the IO thread during output bursts.
+    if (comptime builtin.os.tag == .windows) self.stopIoThread();
+
     // Stop rendering thread
     {
         self.renderer_thread.stop.notify() catch |err|
             log.err("error notifying renderer thread to stop, may stall err={}", .{err});
-        self.renderer_thr.join();
+        self.joinRuntimeWorker(self.renderer_thr);
     }
 
-    // Stop our IO thread
-    {
-        self.io_thread.stop.notify() catch |err|
-            log.err("error notifying io thread to stop, may stall err={}", .{err});
-        self.io_thr.join();
-    }
+    // Preserve the existing shutdown order on all other platforms.
+    if (comptime builtin.os.tag != .windows) self.stopIoThread();
 
     // We need to deinit AFTER everything is stopped, since there are
     // shared values between the two threads.
@@ -856,6 +906,25 @@ pub fn deinit(self: *Surface) void {
     self.config.deinit();
 
     log.info("surface closed id={x}", .{self.id});
+}
+
+fn stopIoThread(self: *Surface) void {
+    if (comptime builtin.os.tag == .windows) log.debug("Windows shutdown checkpoint: notify IO stop", .{});
+    self.io_thread.stop.notify() catch |err|
+        log.err("error notifying io thread to stop, may stall err={}", .{err});
+    if (comptime builtin.os.tag == .windows) log.debug("Windows shutdown checkpoint: joining IO", .{});
+    self.joinRuntimeWorker(self.io_thr);
+    if (comptime builtin.os.tag == .windows) log.debug("Windows shutdown checkpoint: IO joined", .{});
+}
+
+fn joinRuntimeWorker(self: *Surface, thread: std.Thread) void {
+    const ledger_handle = if (comptime builtin.os.tag == .windows) thread.getHandle() else {};
+    if (comptime @hasDecl(apprt.runtime.App, "joinWorkerDuringClose")) {
+        self.rt_surface.rtApp().joinWorkerDuringClose(thread);
+    } else {
+        thread.join();
+    }
+    if (comptime builtin.os.tag == .windows) @import("os/windows_resource_ledger.zig").release(ledger_handle, .join_returned);
 }
 
 /// Close this surface. This will trigger the runtime to start the
@@ -1395,7 +1464,7 @@ fn childExitedAbnormally(
     // Output our error message
     try t.setAttribute(.{ .@"8_fg" = .bright_red });
     try t.setAttribute(.{ .bold = {} });
-    try t.printString("Ghostty failed to launch the requested command:");
+    try t.printString(@import("apprt/win32/sandbox_branding.zig").launchFailure(@import("build_config.zig").windows_sandbox_default));
     try t.setAttribute(.{ .unset = {} });
 
     t.carriageReturn();

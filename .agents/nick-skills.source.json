@@ -1,0 +1,16 @@
+{
+  "source": "https://github.com/nickza2026/nick-skills",
+  "revision": "7967e6f7112a97cbf2262ea50665a9ba2739d3ca",
+  "installation": "manual-project-scoped-copy",
+  "directory": ".agents/skills",
+  "verified_source_files": 52,
+  "skills": [
+    "bootstrapping-go-backends",
+    "committing-to-github",
+    "debugging-backend-issues",
+    "deploying-go-to-nortezh",
+    "designing-backend-systems",
+    "initializing-agent-teams",
+    "reviewing-backend-prs"
+  ]
+}

@@ -123,8 +123,8 @@ pub fn threadEnter(
     // Create our pipe that we'll use to kill our read thread.
     // pipe[0] is the read end, pipe[1] is the write end.
     const pipe = try internal_os.pipe();
-    errdefer _ = posix.system.close(pipe[0]);
-    errdefer _ = posix.system.close(pipe[1]);
+    errdefer closeReadPipe(pipe[0]);
+    errdefer closeReadPipe(pipe[1]);
 
     // Setup our stream so that we can write.
     var stream = xev.Stream.initFd(pty_fds.write);
@@ -142,6 +142,7 @@ pub fn threadEnter(
         if (builtin.os.tag == .windows) ReadThread.threadMainWindows else ReadThread.threadMainPosix,
         .{ pty_fds.read, io, pipe[0] },
     );
+    if (comptime builtin.os.tag == .windows) @import("../os/windows_resource_ledger.zig").acquire(.reader, read_thread.getHandle());
     read_thread.setName(global.io(), "io-reader") catch {};
 
     // Setup our threadata backend state to be our own
@@ -198,35 +199,68 @@ pub fn threadExit(self: *Exec, td: *termio.Termio.ThreadData) void {
     const exec = &td.backend.exec;
 
     if (exec.exited) self.subprocess.externalExit();
+    if (comptime builtin.os.tag == .windows) log.debug("Windows shutdown checkpoint: stopping child", .{});
     self.subprocess.stop();
+    if (comptime builtin.os.tag == .windows) log.debug("Windows shutdown checkpoint: child stopped", .{});
 
     // Quit our read thread after exiting the subprocess so that
     // we don't get stuck waiting for data to stop flowing if it is
     // a particularly noisy process.
-    switch (posix.errno(posix.system.write(exec.read_thread_pipe, "x", 1))) {
-        .SUCCESS => {},
-
-        // EPIPE means that our read thread is closed already, which is
-        // completely fine since that is what we were trying to achieve.
-        .PIPE => {},
-
-        else => |e| log.warn(
-            "error writing to read thread quit pipe err=E{s}",
-            .{@tagName(e)},
-        ),
-    }
+    signalReadPipe(exec.read_thread_pipe);
 
     if (comptime builtin.os.tag == .windows) {
-        // Interrupt the blocking read so the thread can see the quit message
-        if (windows.exp.kernel32.CancelIoEx(exec.read_thread_fd, null) == windows.FALSE) {
-            switch (windows.GetLastError()) {
-                .NOT_FOUND => {},
-                else => |err| log.warn("error interrupting read thread err={}", .{err}),
+        log.debug("Windows shutdown checkpoint: cancelling and joining reader", .{});
+        cancelWindowsReaderAndJoin(exec.read_thread);
+        log.debug("Windows shutdown checkpoint: reader completed", .{});
+    } else exec.read_thread.join();
+}
+
+fn cancelWindowsReaderAndJoin(thread: std.Thread) void {
+    // Cancel synchronous IO on its thread, not an overlapped request on a pipe.
+    // Retry: cancellation may arrive between parsing and the next blocking read.
+    const Native = struct {
+        extern "kernel32" fn CancelSynchronousIo(windows.HANDLE) callconv(.winapi) i32;
+    };
+    const handle = thread.getHandle();
+    var warned = false;
+    while (windows.exp.kernel32.WaitForSingleObject(handle, 0) == 258) { // WAIT_TIMEOUT
+        if (Native.CancelSynchronousIo(handle) == 0) {
+            const err = windows.GetLastError();
+            if (err != .NOT_FOUND and !warned) {
+                log.warn("error cancelling synchronous reader err={}", .{err});
+                warned = true;
             }
         }
+        _ = windows.exp.kernel32.WaitForSingleObject(handle, 10);
     }
+    thread.join();
+    @import("../os/windows_resource_ledger.zig").release(handle, .join_returned);
+}
 
-    exec.read_thread.join();
+test "Windows reader cancellation retries across a not-pending interval" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    var read: windows.HANDLE = undefined;
+    var write: windows.HANDLE = undefined;
+    try std.testing.expect(windows.exp.kernel32.CreatePipe(&read, &write, null, 0) != windows.FALSE);
+    defer _ = windows.exp.kernel32.CloseHandle(read);
+    defer _ = windows.exp.kernel32.CloseHandle(write);
+    const Reader = struct {
+        fd: windows.HANDLE,
+        cancelled: bool = false,
+        extern "kernel32" fn Sleep(u32) callconv(.winapi) void;
+        fn run(self: *@This()) void {
+            // A single CancelSynchronousIo before this read cannot cancel it.
+            Sleep(30);
+            var byte: [1]u8 = undefined;
+            var n: windows.DWORD = 0;
+            if (windows.exp.kernel32.ReadFile(self.fd, &byte, 1, &n, null) == windows.FALSE)
+                self.cancelled = windows.GetLastError() == .OPERATION_ABORTED;
+        }
+    };
+    var reader: Reader = .{ .fd = read };
+    const thread = try std.Thread.spawn(.{}, Reader.run, .{&reader});
+    cancelWindowsReaderAndJoin(thread);
+    try std.testing.expect(reader.cancelled);
 }
 
 pub fn focusGained(
@@ -547,7 +581,7 @@ pub const ThreadData = struct {
     termios_mode: ptypkg.Mode = .{},
 
     pub fn deinit(self: *ThreadData, alloc: Allocator) void {
-        _ = posix.system.close(self.read_thread_pipe);
+        closeReadPipe(self.read_thread_pipe);
 
         // Clear our write pool. We know we aren't ever going to do
         // any more IO since we stop our data stream below so we can just
@@ -623,6 +657,31 @@ const Subprocess = struct {
         var arena = std.heap.ArenaAllocator.init(gpa);
         errdefer arena.deinit();
         const alloc = arena.allocator();
+
+        if (comptime build_config.windows_sandbox_default) {
+            // Ignore config command, cwd, shell integration and env overrides.
+            // Revalidate immediately before preparing spawn-owned arguments.
+            var inherited = cfg.env;
+            const context = global.sandboxContext() orelse return error.SandboxNotInitialized;
+            var plan = try context.revalidate(gpa, global.io());
+            defer plan.deinit();
+            const args = try alloc.alloc([:0]const u8, 4);
+            for (plan.argv(), 0..) |arg, i| args[i] = try alloc.dupeZ(u8, arg);
+            const cwd = try alloc.dupeZ(u8, plan.root);
+            const env = try context.freshEnvironment(gpa);
+            // Caller retains cfg.env on failure; consume it only on success.
+            inherited.deinit();
+            return .{
+                .arena = arena,
+                .env = env,
+                .cwd = cwd,
+                .args = args,
+                .rt_pre_exec_info = cfg.rt_pre_exec_info,
+                .rt_post_fork_info = cfg.rt_post_fork_info,
+                .grid_size = .{},
+                .screen_size = .{ .width = 1, .height = 1 },
+            };
+        }
 
         // Get our env. If a default env isn't provided by the caller
         // then we get it ourselves.
@@ -812,6 +871,13 @@ const Subprocess = struct {
             break :shell integration.command;
         };
 
+        // Only the explicitly isolated Win32 tool mode drops inherited Node,
+        // npm, endpoint/auth and harness injections from THIS child's map.
+        if (comptime builtin.os.tag == .windows) {
+            if (cfg.env_override.map.get("LOCALTERM_PORTABLE_TOOLS")) |mode| {
+                if (std.mem.eql(u8, mode, "1")) try @import("../os/windows_portable_env.zig").sanitize(&env);
+            }
+        }
         // Add the environment variables that override any others.
         {
             var it = cfg.env_override.iterator();
@@ -895,6 +961,14 @@ const Subprocess = struct {
     } {
         assert(self.pty == null and self.process == null);
 
+        if (comptime build_config.windows_sandbox_default) {
+            const context = global.sandboxContext() orelse return error.SandboxNotInitialized;
+            var validated = try context.revalidate(alloc, global.io());
+            defer validated.deinit();
+            const layout = global.portablePaths() orelse return error.SandboxNotInitialized;
+            try layout.verify(global.io());
+        }
+
         // This function is funny because on POSIX systems it can
         // fail in the forked process. This is flipped to true if
         // we're in an error state in the forked process (child
@@ -977,6 +1051,7 @@ const Subprocess = struct {
             if (std.Io.Dir.cwd().access(global.io(), proposed, .{})) {
                 break :cwd proposed;
             } else |err| {
+                if (comptime build_config.windows_sandbox_default) return err;
                 log.warn("cannot access cwd, ignoring: {}", .{err});
                 break :cwd null;
             }
@@ -1100,6 +1175,12 @@ const Subprocess = struct {
     /// Called to notify that we exited externally so we can unset our
     /// running state.
     pub fn externalExit(self: *Subprocess) void {
+        if (comptime builtin.os.tag == .windows) {
+            if (self.process) |*process| switch (process.*) {
+                .fork_exec => |*cmd| cmd.deinit(),
+                else => {},
+            };
+        }
         self.process = null;
     }
 
@@ -1110,6 +1191,7 @@ const Subprocess = struct {
     pub fn stop(self: *Subprocess) void {
         switch (self.process orelse return) {
             .fork_exec => |*cmd| {
+                defer cmd.deinit();
                 // Note: this will also wait for the command to exit, so
                 // DO NOT call cmd.wait
                 killCommand(cmd) catch |err|
@@ -1772,7 +1854,7 @@ pub const ReadThread = struct {
 
     fn threadMainWindows(fd: posix.fd_t, io: *termio.Termio, quit: posix.fd_t) void {
         // Always close our end of the pipe when we exit.
-        defer _ = posix.system.close(quit);
+        defer closeReadPipe(quit);
 
         // Setup our crash metadata
         crash.sentry.thread_state = .{
@@ -1784,19 +1866,37 @@ pub const ReadThread = struct {
         var buf: [1024]u8 = undefined;
         while (true) {
             while (true) {
+                // A busy pipe may never return OPERATION_ABORTED: cancellation
+                // can race with parsing between reads. Observe sticky quit on
+                // every iteration, not only after a cancelled ReadFile.
+                var pending_quit: windows.DWORD = 0;
+                if (windows.exp.kernel32.PeekNamedPipe(quit, null, 0, null, &pending_quit, null) == windows.FALSE) {
+                    log.err("quit pipe reader error err={}", .{windows.GetLastError()});
+                    return;
+                }
+                if (pending_quit > 0) {
+                    log.info("read thread got quit signal", .{});
+                    return;
+                }
                 var n: windows.DWORD = 0;
                 if (windows.exp.kernel32.ReadFile(fd, &buf, buf.len, &n, null) == windows.FALSE) {
                     const err = windows.GetLastError();
-                    switch (err) {
+                    switch (windowsReadDisposition(err)) {
                         // Check for a quit signal
-                        .OPERATION_ABORTED => break,
+                        .cancelled => break,
 
-                        else => {
+                        // A closed ConPTY output pipe is EOF, not an invariant
+                        // failure. Defer closes the reader's quit-pipe end too.
+                        .eof => return,
+
+                        .unexpected => {
                             log.err("io reader error err={}", .{err});
-                            unreachable;
+                            return;
                         },
                     }
                 }
+
+                if (n == 0) return;
 
                 @call(.always_inline, termio.Termio.processOutput, .{ io, buf[0..n] });
 
@@ -1810,7 +1910,7 @@ pub const ReadThread = struct {
             if (windows.exp.kernel32.PeekNamedPipe(quit, null, 0, null, &quit_bytes, null) == windows.FALSE) {
                 const err = windows.GetLastError();
                 log.err("quit pipe reader error err={}", .{err});
-                unreachable;
+                return;
             }
 
             if (quit_bytes > 0) {
@@ -1820,6 +1920,69 @@ pub const ReadThread = struct {
         }
     }
 };
+
+const WindowsReadDisposition = enum { cancelled, eof, unexpected };
+
+fn closeReadPipe(fd: posix.fd_t) void {
+    if (comptime builtin.os.tag == .windows) {
+        if (windows.exp.kernel32.CloseHandle(fd) == windows.FALSE)
+            log.err("quit pipe CloseHandle failed err={}", .{windows.GetLastError()});
+    } else {
+        _ = posix.system.close(fd);
+    }
+}
+
+fn signalReadPipe(fd: posix.fd_t) void {
+    if (comptime builtin.os.tag == .windows) {
+        var written: windows.DWORD = 0;
+        if (windows.exp.kernel32.WriteFile(fd, "x", 1, &written, null) == windows.FALSE) {
+            const err = windows.GetLastError();
+            if (windowsReadDisposition(err) != .eof)
+                log.err("quit pipe WriteFile failed err={}", .{err});
+        } else if (written != 1) {
+            log.err("quit pipe short write bytes={d}", .{written});
+        }
+    } else {
+        switch (posix.errno(posix.system.write(fd, "x", 1))) {
+            .SUCCESS, .PIPE => {},
+            else => |e| log.warn("error writing to read thread quit pipe err=E{s}", .{@tagName(e)}),
+        }
+    }
+}
+
+fn windowsReadDisposition(err: std.os.windows.Win32Error) WindowsReadDisposition {
+    return switch (err) {
+        .OPERATION_ABORTED => .cancelled,
+        .BROKEN_PIPE, .PIPE_NOT_CONNECTED, .NO_DATA => .eof,
+        else => .unexpected,
+    };
+}
+
+test "Windows reader EOF and cancellation classification" {
+    const testing = std.testing;
+    try testing.expectEqual(WindowsReadDisposition.cancelled, windowsReadDisposition(.OPERATION_ABORTED));
+    for ([_]std.os.windows.Win32Error{ .BROKEN_PIPE, .PIPE_NOT_CONNECTED, .NO_DATA }) |err|
+        try testing.expectEqual(WindowsReadDisposition.eof, windowsReadDisposition(err));
+    try testing.expectEqual(WindowsReadDisposition.unexpected, windowsReadDisposition(.ACCESS_DENIED));
+}
+
+test "Windows reader native quit pipe roundtrip and EOF" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const pipe = try internal_os.pipe();
+    defer closeReadPipe(pipe[0]);
+    var writer_live = true;
+    defer if (writer_live) closeReadPipe(pipe[1]);
+    signalReadPipe(pipe[1]);
+    var byte: [1]u8 = undefined;
+    var read: windows.DWORD = 0;
+    try std.testing.expect(windows.exp.kernel32.ReadFile(pipe[0], &byte, 1, &read, null) != windows.FALSE);
+    try std.testing.expectEqual(@as(windows.DWORD, 1), read);
+    try std.testing.expectEqual(@as(u8, 'x'), byte[0]);
+    closeReadPipe(pipe[1]);
+    writer_live = false;
+    try std.testing.expect(windows.exp.kernel32.ReadFile(pipe[0], &byte, 1, &read, null) == windows.FALSE);
+    try std.testing.expectEqual(WindowsReadDisposition.eof, windowsReadDisposition(windows.GetLastError()));
+}
 
 /// Builds the argv array for the process we should exec for the
 /// configured command. This isn't as straightforward as it seems since

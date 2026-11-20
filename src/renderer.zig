@@ -38,7 +38,7 @@ pub const Renderer = GenericRenderer(GraphicsAPI);
 
 const GraphicsAPI = switch (build_config.renderer) {
     .metal => Metal,
-    .opengl => OpenGL,
+    .opengl => if (build_config.windows_remote_renderer) @import("renderer/Remote.zig") else OpenGL,
 };
 
 /// The app-scoped render device from which surface renderers are created.
@@ -57,6 +57,14 @@ pub const Health = enum(c_int) {
 };
 
 test {
+    _ = @import("renderer/CpuPreparation.zig");
+    _ = @import("renderer/GlslData.zig");
+    _ = @import("renderer/GlslCatalog.zig");
+    _ = @import("renderer/remote/Protocol.zig");
+    _ = @import("renderer/remote/Registry.zig");
+    _ = @import("renderer/remote/Commands.zig");
+    _ = @import("renderer/remote/ShaderPayload.zig");
+    _ = @import("renderer/remote/TextFrame.zig");
     // Our comptime-chosen renderer
     _ = Renderer;
 

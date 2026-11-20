@@ -122,7 +122,12 @@ pub fn init(
 ) !Thread {
     // Create our event loop.
     var loop = try xev.Loop.init(.{});
-    errdefer loop.deinit();
+    const ledger_port = if (comptime builtin.os.tag == .windows) @import("../os/windows_resource_ledger.zig").loopHandle(&loop) else {};
+    if (comptime builtin.os.tag == .windows) @import("../os/windows_resource_ledger.zig").acquire(.renderer_iocp, ledger_port);
+    errdefer {
+        loop.deinit();
+        if (comptime builtin.os.tag == .windows) @import("../os/windows_resource_ledger.zig").release(ledger_port, .deinit_returned);
+    }
 
     // This async handle is used to "wake up" the renderer and force a render.
     var wakeup_h = try xev.Async.init();
@@ -182,7 +187,9 @@ pub fn deinit(self: *Thread) void {
     self.cursor_h.deinit();
     if (comptime terminalpkg.compression_enabled)
         self.compression.deinit();
+    const ledger_port = if (comptime builtin.os.tag == .windows) @import("../os/windows_resource_ledger.zig").loopHandle(&self.loop) else {};
     self.loop.deinit();
+    if (comptime builtin.os.tag == .windows) @import("../os/windows_resource_ledger.zig").release(ledger_port, .deinit_returned);
 
     // Nothing can possibly access the mailbox anymore, destroy it.
     self.mailbox.destroy(self.alloc);

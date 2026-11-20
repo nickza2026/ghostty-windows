@@ -28,6 +28,11 @@ const ArenaAllocator = std.heap.ArenaAllocator;
 const Terminal = terminal.Terminal;
 const Health = renderer.Health;
 const compat_file = @import("../lib/compat/file.zig");
+const CpuPreparation = @import("CpuPreparation.zig");
+const TextFrame = @import("remote/TextFrame.zig");
+const ImageFrame = @import("remote/ImageFrame.zig");
+const ViewportEpoch = @import("remote/ViewportEpoch.zig");
+const TextParity = @import("remote/TextParity.zig");
 
 const getConstraint = @import("../font/nerd_font_attributes.zig").getConstraint;
 
@@ -88,6 +93,7 @@ const log = std.log.scoped(.generic_renderer);
 ///                     UI elements by the graphical toolkit manually.
 ///
 pub fn Renderer(comptime GraphicsAPI: type) type {
+    const is_remote = @hasDecl(GraphicsAPI, "is_remote") and GraphicsAPI.is_remote;
     return struct {
         const Self = @This();
 
@@ -120,6 +126,14 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
         /// The mailbox for communicating with the window.
         surface_mailbox: apprt.surface.Mailbox,
+
+        /// Only controlled native fixtures opt in; production sessions never do.
+        check_cpu_text_frames: bool = false,
+        check_gpu_text_frames: bool = false,
+        gpu_text_parity: TextParity = .{},
+        cpu_text_frames_checked: std.atomic.Value(u32) = .init(0),
+        cpu_text_glyph_frames_checked: std.atomic.Value(u32) = .init(0),
+        cpu_text_frame_failures: std.atomic.Value(u32) = .init(0),
 
         /// The latest exported frame ready to be consumed by an apprt
         /// who needs to manually composite the frame with UI elements.
@@ -244,6 +258,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// True when we have a graphics context that can create GPU
         /// resources. Creating any GPU resource while this is false is invalid.
         display_realized: bool = true,
+        remote_viewport: ViewportEpoch = .{},
+        remote_viewport_target: ?renderer.ScreenSize = null,
+        remote_viewport_pending: bool = false,
+        remote_stale_frames: std.atomic.Value(u32) = .init(0),
 
         /// Our swap chain (multiple buffering). Null when it has
         /// been released, either because the surface is hidden
@@ -296,7 +314,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// Swap chain which maintains multiple copies of the state needed to
         /// render a frame, so that we can start building the next frame while
         /// the previous frame is still being processed on the GPU.
-        const SwapChain = struct {
+        const SwapChain = if (is_remote) void else struct {
             // The count of buffers we use for double/triple buffering.
             // If this is one then we don't do any double+ buffering at all.
             // This is comptime because there isn't a good reason to change
@@ -356,7 +374,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// reports that the frame is complete.
         ///
         /// This is used to implement double/triple buffering.
-        const FrameState = struct {
+        const FrameState = if (is_remote) void else struct {
             uniforms: UniformBuffer,
             cells: CellTextBuffer,
             cells_bg: CellBgBuffer,
@@ -478,7 +496,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         };
 
         /// State relevant to our custom shaders if we have any.
-        const CustomShaderState = struct {
+        const CustomShaderState = if (is_remote) void else struct {
             /// When we have a custom shader state, we maintain a front
             /// and back texture which we use as a swap chain to render
             /// between when multiple custom shaders are defined.
@@ -704,6 +722,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         };
 
         pub fn init(alloc: Allocator, options: renderer.Options) !Self {
+            var cpu: ?CpuPreparation = null;
+            defer if (cpu) |*prepared| prepared.deinit();
+            // Windows worker integration must prepare CPU state without first
+            // creating a WGL context. Other runtimes retain their init ordering.
+            if (comptime builtin.os.tag == .windows) cpu = try prepareCPU(alloc, options);
+
             // Initialize our graphics API wrapper, this will prepare the
             // surface provided by the apprt and set up any API- and surface-
             // specific GPU resources.
@@ -715,30 +739,15 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             errdefer api.deinit();
 
             const has_custom_shaders = options.config.custom_shaders.value.items.len > 0;
-
-            // Create the font shaper.
-            var font_shaper = try font.Shaper.init(alloc, .{
-                .features = options.config.font_features.items,
-            });
-            errdefer font_shaper.deinit();
-
-            // Initialize all the data that requires a critical font section.
-            const font_critical: struct {
-                metrics: font.Metrics,
-            } = font_critical: {
-                const grid: *font.SharedGrid = options.font_grid;
-                grid.lock.lockSharedUncancelable(global.io());
-                defer grid.lock.unlockShared(global.io());
-                break :font_critical .{
-                    .metrics = grid.metrics,
-                };
-            };
+            if (cpu == null) cpu = try prepareCPU(alloc, options);
 
             var result: Self = .{
                 .alloc = alloc,
                 .config = options.config,
                 .surface_mailbox = options.surface_mailbox,
-                .grid_metrics = font_critical.metrics,
+                .check_cpu_text_frames = options.check_cpu_text_frames,
+                .check_gpu_text_frames = options.check_gpu_text_frames,
+                .grid_metrics = cpu.?.metrics,
                 .size = options.size,
                 .focused = true,
                 .visible = true,
@@ -811,7 +820,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
                 // Fonts
                 .font_grid = options.font_grid,
-                .font_shaper = font_shaper,
+                .font_shaper = cpu.?.shaper.?,
                 .font_shaper_cache = font.ShaperCache.init(),
 
                 // Graphics API stuff
@@ -829,7 +838,22 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             result.updateBgImageBuffer();
             try result.prepBackgroundImage();
 
+            // result borrows the shaper until every fallible init step passes.
+            // Earlier failures leave CPU ownership with the deferred cleanup.
+            _ = cpu.?.takeShaper();
             return result;
+        }
+
+        fn prepareCPU(alloc: Allocator, options: renderer.Options) !CpuPreparation {
+            const metrics = metrics: {
+                const grid = options.font_grid;
+                grid.lock.lockSharedUncancelable(global.io());
+                defer grid.lock.unlockShared(global.io());
+                break :metrics grid.metrics;
+            };
+            return CpuPreparation.init(alloc, .{
+                .features = options.config.font_features.items,
+            }, metrics);
         }
 
         pub fn deinit(self: *Self) void {
@@ -906,6 +930,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// render thread. Releases all GPU resources before the API tears down
         /// its context, since after this the GL context will be gone.
         pub fn threadExit(self: *Self) void {
+            if (comptime builtin.os.tag == .windows and @hasDecl(apprt.Surface, "wantsGpuTextFrameChecks")) {
+                if (self.check_gpu_text_frames) self.gpu_text_parity.close() catch |err| {
+                    log.err("controlled GPU text parity close failed err={}", .{err});
+                };
+            }
             {
                 self.draw_mutex.lockUncancelable(global.io());
                 defer self.draw_mutex.unlock(global.io());
@@ -979,6 +1008,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // Lock the draw mutex so that we can safely update state.
             self.draw_mutex.lockUncancelable(global.io());
             defer self.draw_mutex.unlock(global.io());
+            if (comptime is_remote) try self.invalidateRemoteViewport();
 
             // Mark the display as realized. The render thread will lazily
             // rebuild the swap chain and shaders on the next `drawFrame`,
@@ -1005,6 +1035,28 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // to rebuild the swap chain or make any graphics API calls.
             // The actual GPU resource release is done by the render thread.
             self.display_realized = false;
+            if (comptime is_remote) self.invalidateRemoteViewport() catch |err| {
+                log.err("remote unrealize epoch failed: {}", .{err});
+            };
+        }
+
+        /// Caller holds draw_mutex. Drop queued images as well as fencing RPC
+        /// replies: otherwise an already-queued old frame could survive resize.
+        fn invalidateRemoteViewport(self: *Self) !void {
+            self.latest_frame.deinit(global.io());
+            try self.remote_viewport.advance();
+        }
+
+        /// UI boundary, BEFORE Core queues its renderer resize message. An RPC
+        /// may currently be in flight, so invalidate it now, not when this
+        /// renderer thread eventually drains that mailbox. Never waits on IPC.
+        pub fn invalidateRemoteViewportFromUI(self: *Self, width: u32, height: u32, font_change: bool) !void {
+            if (comptime !is_remote) return;
+            self.draw_mutex.lockUncancelable(global.io());
+            defer self.draw_mutex.unlock(global.io());
+            try self.invalidateRemoteViewport();
+            self.remote_viewport_target = .{ .width = width, .height = height };
+            self.remote_viewport_pending = font_change or self.size.screen.width != width or self.size.screen.height != height;
         }
 
         /// A thread-safe, single-slot "latest wins" queue. The render thread
@@ -1236,16 +1288,18 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// Caller must lock the draw mutex before calling this function.
         /// Resources that are already released are skipped.
         pub fn releaseGpuResources(self: *Self) void {
-            if (self.swap_chain) |*sc| {
-                // Waits for any in-flight frames to complete, then
-                // frees all GPU resources.
-                sc.deinit();
-                self.swap_chain = null;
-            }
+            if (comptime is_remote) return else {
+                if (self.swap_chain) |*sc| {
+                    // Waits for any in-flight frames to complete, then
+                    // frees all GPU resources.
+                    sc.deinit();
+                    self.swap_chain = null;
+                }
 
-            // Release the shaders as well if we're unrealized.
-            if (!self.display_realized) {
-                self.shaders.deinit(self.alloc);
+                // Release the shaders as well if we're unrealized.
+                if (!self.display_realized) {
+                    self.shaders.deinit(self.alloc);
+                }
             }
         }
 
@@ -1317,7 +1371,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // We can modify this without a lock because the GPU does not
             // touch this data. A released swap chain is rebuilt with
             // fresh frames that sync all textures on first use.
-            if (self.swap_chain) |*sc| for (&sc.frames) |*frame| {
+            if (comptime !is_remote) if (self.swap_chain) |*sc| for (&sc.frames) |*frame| {
                 frame.grayscale_modified = 0;
                 frame.color_modified = 0;
             };
@@ -1708,17 +1762,78 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self: *Self,
             sync: bool,
         ) !void {
-            // Everything that touches draw state happens under the draw
-            // mutex. The display link is synced after the mutex is
-            // released. It doesn't need the lock, and this keeps the
-            // critical section to just drawing.
-            const sync_display_link = locked: {
+            if (comptime is_remote) return self.drawRemoteFrame() catch |err| {
+                self.api.renderFailed(); // All draw/font locks have unwound.
+                _ = self.cpu_text_frame_failures.fetchAdd(1, .release);
+                if (self.health.swap(.unhealthy, .seq_cst) != .unhealthy) {
+                    _ = self.surface_mailbox.push(.{ .renderer_health = .unhealthy }, .instant);
+                }
+                log.err("remote frame failed: {}", .{err});
+                return err;
+            } else {
+                errdefer if (self.check_gpu_text_frames) {
+                    _ = self.gpu_text_parity.failures.fetchAdd(1, .release);
+                };
+                // Everything that touches draw state happens under the draw
+                // mutex. The display link is synced after the mutex is
+                // released. It doesn't need the lock, and this keeps the
+                // critical section to just drawing.
+                const sync_display_link = locked: {
+                    self.draw_mutex.lockUncancelable(global.io());
+                    defer self.draw_mutex.unlock(global.io());
+                    break :locked try self.drawFrameLocked(sync);
+                };
+
+                if (comptime builtin.os.tag == .windows and @hasDecl(apprt.Surface, "wantsGpuTextFrameChecks")) {
+                    // The owned CPU packet/reference were captured under draw_mutex.
+                    // Process/IPC waits happen ONLY here, after releasing that lock.
+                    if (self.check_gpu_text_frames) try self.gpu_text_parity.process(self.alloc);
+                }
+                if (sync_display_link) self.syncDisplayLink(null, null);
+            }
+        }
+
+        fn drawRemoteFrame(self: *Self) !void {
+            const profile_start = self.api.profileTick();
+            var epoch: u64 = 0;
+            var packet = locked: {
                 self.draw_mutex.lockUncancelable(global.io());
                 defer self.draw_mutex.unlock(global.io());
-                break :locked try self.drawFrameLocked(sync);
+                if (!self.display_realized or self.remote_viewport_pending or self.size.screen.width == 0 or self.size.screen.height == 0 or self.cells.bg_cells.len == 0) return;
+                epoch = self.remote_viewport.capture();
+                const owned = if (comptime @import("../build_config.zig").windows_remote_images)
+                    try self.captureImageFrameLocked(self.alloc)
+                else
+                    try self.captureTextFrameLocked(self.alloc, .{ .dimension = 32768, .atlas_dimension = 32768, .cells = 1024 * 1024, .bytes = 64 * 1024 * 1024 });
+                break :locked owned;
             };
-
-            if (sync_display_link) self.syncDisplayLink(null, null);
+            defer packet.deinit();
+            const profile_captured = self.api.profileTick();
+            // All blocking process/IPC work happens after the lock scope ends.
+            const exported = try self.api.render(packet.bytes, epoch);
+            const profile_received = self.api.profileTick();
+            var published = false;
+            defer if (!published) exported.deinit();
+            {
+                self.draw_mutex.lockUncancelable(global.io());
+                defer self.draw_mutex.unlock(global.io());
+                if (self.remote_viewport_pending or !self.remote_viewport.accepts(epoch, self.display_realized)) {
+                    _ = self.remote_stale_frames.fetchAdd(1, .release);
+                    return;
+                }
+                self.pushFrame(exported);
+                published = true;
+            }
+            if (self.check_cpu_text_frames) {
+                const decoded = if (comptime @import("../build_config.zig").windows_remote_images)
+                    (try ImageFrame.decode(packet.bytes, .{})).text
+                else
+                    try TextFrame.decode(packet.bytes, .{ .dimension = 32768, .atlas_dimension = 32768, .cells = 1024 * 1024, .bytes = 64 * 1024 * 1024 });
+                _ = self.cpu_text_frames_checked.fetchAdd(1, .release);
+                if (decoded.foreground.len != 0) _ = self.cpu_text_glyph_frames_checked.fetchAdd(1, .release);
+            }
+            try self.api.notifyFrame();
+            self.api.profileFrame(.{ profile_start, profile_captured, profile_received, self.api.profileTick() }, packet.bytes.len);
         }
 
         /// The body of `drawFrame`. Must be called with `draw_mutex` held.
@@ -1852,6 +1967,37 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     self.size.screen.height,
                 );
                 frame.target_config_modified = self.target_config_modified;
+            }
+
+            if (self.check_cpu_text_frames) {
+                errdefer _ = self.cpu_text_frame_failures.fetchAdd(1, .release);
+                var packet = try self.captureTextFrameLocked(self.alloc, .{
+                    .dimension = 32768,
+                    .atlas_dimension = 32768,
+                    .cells = 1024 * 1024,
+                    .bytes = 64 * 1024 * 1024,
+                });
+                var transferred = false;
+                defer if (!transferred) packet.deinit();
+                const decoded = try TextFrame.decode(packet.bytes, .{
+                    .dimension = 32768,
+                    .atlas_dimension = 32768,
+                    .cells = 1024 * 1024,
+                    .bytes = 64 * 1024 * 1024,
+                });
+                _ = self.cpu_text_frames_checked.fetchAdd(1, .release);
+                if (decoded.foreground.len != 0 and self.cpu_text_glyph_frames_checked.fetchAdd(1, .release) == 0) {
+                    log.info("controlled real terminal CPU text frame validated width={d} height={d} glyphs={d} bytes={d}; no GPU-worker claim", .{
+                        decoded.width,
+                        decoded.height,
+                        decoded.foreground.len / @import("remote/ShaderPayload.zig").cell_bytes,
+                        packet.bytes.len,
+                    });
+                }
+                if (self.check_gpu_text_frames and decoded.foreground.len != 0) {
+                    self.gpu_text_parity.capture(packet);
+                    transferred = true;
+                }
             }
 
             // Upload images to the GPU as necessary.
@@ -2028,6 +2174,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 }
             }
 
+            if (comptime builtin.os.tag == .windows and @hasDecl(apprt.Surface, "wantsGpuTextFrameChecks")) {
+                if (self.check_gpu_text_frames and self.gpu_text_parity.pending != null)
+                    self.gpu_text_parity.setReference(self.alloc, try frame.target.readPixelsAlloc(self.alloc));
+            }
             return false;
         }
 
@@ -2158,6 +2308,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
         /// Update the configuration.
         pub fn changeConfig(self: *Self, config: *DerivedConfig) !void {
+            // Remote text-only mode must reject unsupported updates before
+            // transferring config ownership or mutating the CPU font state.
+            if (comptime is_remote) {
+                if (config.bg_image != null or config.custom_shaders.value.items.len != 0)
+                    return error.UnsupportedRemoteFeatures;
+            }
             self.draw_mutex.lockUncancelable(global.io());
             defer self.draw_mutex.unlock(global.io());
 
@@ -2242,8 +2398,17 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self.draw_mutex.lockUncancelable(global.io());
             defer self.draw_mutex.unlock(global.io());
 
+            if (comptime is_remote) self.invalidateRemoteViewport() catch |err| {
+                self.display_realized = false;
+                log.err("remote resize epoch failed: {}", .{err});
+                return;
+            };
+
             self.size = size;
             self.updateScreenSizeUniforms();
+            if (comptime is_remote) if (self.remote_viewport_target) |target| {
+                self.remote_viewport_pending = !size.screen.equals(target);
+            };
 
             // Some graphics APIs need to manually update their viewport,
             // like OpenGL. Do so here.
@@ -3658,6 +3823,51 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             if (cp.wide and coord.x < self.cells.size.columns - 1) {
                 try self.addUnderline(@intCast(coord.x + 1), @intCast(coord.y), .single, screen_fg, 255);
             }
+        }
+
+        /// Renderer-thread CPU capture seam. Caller MUST already hold draw_mutex.
+        /// Copies stable atlas bytes under the font read lock; never waits for
+        /// GPU/IPC/UI, publishes shared memory or writes session data to disk.
+        /// A future remote draw path must release draw_mutex before IPC waits.
+        pub fn captureTextFrameLocked(self: *Self, alloc: Allocator, limits: TextFrame.Limits) !TextFrame.Owned {
+            if (comptime builtin.os.tag != .windows) return error.TextFrameRequiresWindows;
+            if (self.bg_image != null or self.has_custom_shaders or self.overlay != null or self.images.images.count() != 0)
+                return error.UnsupportedTextFrameFeatures;
+            return self.captureTextCellsLocked(alloc, limits);
+        }
+
+        /// Experimental flag only. Caller holds draw_mutex; no GPU/IPC work.
+        fn captureImageFrameLocked(self: *Self, alloc: Allocator) !TextFrame.Owned {
+            if (self.bg_image != null or self.has_custom_shaders or self.overlay != null) return error.UnsupportedTextFrameFeatures;
+            var images = try self.images.captureCpuSnapshot(alloc, self.uniforms.cell_size, .{});
+            defer images.deinit();
+            var text = try self.captureTextCellsLocked(alloc, .{ .dimension = 32768, .atlas_dimension = 32768, .cells = 1024 * 1024, .bytes = 64 * 1024 * 1024 });
+            defer text.deinit();
+            const owned = try ImageFrame.encodeAlloc(alloc, text.bytes, images.bytes, .{});
+            return .{ .alloc = owned.alloc, .bytes = owned.bytes };
+        }
+
+        fn captureTextCellsLocked(self: *Self, alloc: Allocator, limits: TextFrame.Limits) !TextFrame.Owned {
+            if (comptime builtin.os.tag == .windows) {
+                self.font_grid.lock.lockSharedUncancelable(global.io());
+                defer self.font_grid.lock.unlockShared(global.io());
+                if (self.font_grid.atlas_grayscale.format != .grayscale or self.font_grid.atlas_color.format != .bgra)
+                    return error.UnsupportedTextFrameAtlas;
+                return TextFrame.encodeAlloc(alloc, .{
+                    .width = self.size.screen.width,
+                    .height = self.size.screen.height,
+                    .blending = switch (self.config.blending) {
+                        .native => .native,
+                        .linear => .linear,
+                        .@"linear-corrected" => .linear_corrected,
+                    },
+                    .uniforms = self.uniforms,
+                    .background = self.cells.bg_cells,
+                    .foreground_rows = self.cells.fg_rows,
+                    .grayscale = .{ .size = self.font_grid.atlas_grayscale.size, .bytes = self.font_grid.atlas_grayscale.data },
+                    .color = .{ .size = self.font_grid.atlas_color.size, .bytes = self.font_grid.atlas_color.data },
+                }, limits);
+            } else return error.TextFrameRequiresWindows;
         }
 
         /// Sync the atlas data to the given texture. This copies the bytes

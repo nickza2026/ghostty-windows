@@ -7,12 +7,15 @@ pub const Context = c.GladGLContext;
 /// any of this package's functions. I know its nasty to have a global but
 /// this makes it match OpenGL API styles where it also operates on a
 /// threadlocal global.
-pub threadlocal var context: Context = undefined;
+// The generated C custom-resolver loader does not initialize glad_loader_handle.
+// Both the first load and subsequent reloads must begin with a null handle.
+pub threadlocal var context: Context = std.mem.zeroes(Context);
 
 /// Initialize Glad. This is guaranteed to succeed if no errors are returned.
 /// The getProcAddress param is an anytype so that we can accept multiple
 /// forms of the function depending on what we're interfacing with.
 pub fn load(getProcAddress: anytype) !c_int {
+    errdefer unload();
     const GlProc = *const fn () callconv(.c) void;
     const GlfwFn = *const fn ([*:0]const u8) callconv(.c) ?GlProc;
 
@@ -33,7 +36,7 @@ pub fn load(getProcAddress: anytype) !c_int {
 
 pub fn unload() void {
     c.gladLoaderUnloadGLContext(&context);
-    context = undefined;
+    context = std.mem.zeroes(Context);
 }
 
 pub fn versionMajor(res: c_uint) c_uint {

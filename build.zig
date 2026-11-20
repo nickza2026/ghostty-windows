@@ -47,6 +47,266 @@ pub fn build(b: *std.Build) !void {
         "Filter for test. Only applies to Zig tests.",
     ) orelse &[0][]const u8{};
 
+    // Phase 3A: a real native window without a fake core Surface, GPU, or PTY.
+    // This explicit opt-in target does not change the default Ghostty build.
+    if (config.target.result.os.tag == .windows) {
+        const window = b.addExecutable(.{
+            .name = "localterm-dev",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/apprt/win32/window_main.zig"),
+                .target = config.target,
+                .optimize = config.optimize,
+                .link_libc = true,
+            }),
+            .use_llvm = true,
+        });
+        window.subsystem = .Windows;
+        // Like GhosttyExe's Win32 build: retain CRT init and Zig's main wrapper.
+        window.entry = .{ .symbol_name = "mainCRTStartup" };
+        window.root_module.linkSystemLibrary("user32", .{});
+        window.root_module.linkSystemLibrary("gdi32", .{});
+        window.root_module.addCSourceFile(.{ .file = b.path("src/apprt/win32/diagnostics.c") });
+        window.root_module.addWin32ResourceFile(.{
+            .file = b.path("dist/windows/localterm-dev.rc"),
+        });
+        const install_window = b.addInstallArtifact(window, .{});
+        b.step("windows-window", "Build the localterm-dev native window prototype (no terminal)")
+            .dependOn(&install_window.step);
+        const run_window = b.addRunArtifact(window);
+        if (b.args) |args| run_window.addArgs(args);
+        b.step("run-windows-window", "Run the native window prototype; pass -- --smoke-test for lifecycle checks")
+            .dependOn(&run_window.step);
+
+        const presenter_tests = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/apprt/win32/presenter.zig"),
+                .target = config.target,
+                .optimize = config.optimize,
+            }),
+            .use_llvm = true,
+        });
+        presenter_tests.root_module.linkSystemLibrary("gdi32", .{});
+        b.step("test-windows-presenter", "Test RGBA/BGRA/row conversion, invalid frames, OOM and BMP header")
+            .dependOn(&b.addRunArtifact(presenter_tests).step);
+
+        const input_tests = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/apprt/win32/text_input.zig"),
+                .target = config.target,
+                .optimize = config.optimize,
+            }),
+            .use_llvm = true,
+        });
+        b.step("test-windows-input", "Test UTF-16/surrogates/Unicode scalar decoding (not paste)")
+            .dependOn(&b.addRunArtifact(input_tests).step);
+
+        const ime_tests = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/apprt/win32/ime.zig"),
+                .target = config.target,
+                .optimize = config.optimize,
+            }),
+            .use_llvm = true,
+        });
+        ime_tests.root_module.linkSystemLibrary("imm32", .{});
+        b.step("test-windows-ime", "Test IMM logical/client pixel geometry (real IME still needs human verification)")
+            .dependOn(&b.addRunArtifact(ime_tests).step);
+
+        const clipboard_tests = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/apprt/win32/clipboard.zig"),
+                .target = config.target,
+                .optimize = config.optimize,
+            }),
+            .use_llvm = true,
+        });
+        clipboard_tests.root_module.linkSystemLibrary("user32", .{});
+        b.step("test-windows-clipboard", "Test bounded text decode/paste policy without reading or changing the system clipboard")
+            .dependOn(&b.addRunArtifact(clipboard_tests).step);
+
+        // Match the upstream SharedDeps module configuration; do not create a
+        // second translate-c variant of the Windows SDK headers for this gate.
+        if (if (config.emit_lib_vt) null else b.lazyDependency("opengl", .{})) |gl_dep| {
+            const probe = b.addExecutable(.{
+                .name = "localterm-dev-gl-probe",
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path("src/win32_gl_probe.zig"),
+                    .target = config.target,
+                    .optimize = config.optimize,
+                    .link_libc = true,
+                }),
+                .use_llvm = true,
+            });
+            probe.root_module.addImport("opengl", gl_dep.module("opengl"));
+            probe.root_module.addIncludePath(b.path("vendor/glad/include"));
+            probe.root_module.addCSourceFile(.{ .file = b.path("vendor/glad/src/gl.c") });
+            probe.root_module.addCSourceFile(.{ .file = b.path("src/apprt/win32/diagnostics.c") });
+            for ([_][]const u8{ "user32", "gdi32", "opengl32" }) |library|
+                probe.root_module.linkSystemLibrary(library, .{});
+            const install_probe = b.addInstallArtifact(probe, .{});
+            b.step("windows-gl-probe", "Build desktop GL 4.3/FBO/thread-handoff capability probe (no terminal)")
+                .dependOn(&install_probe.step);
+            const run_probe = b.addRunArtifact(probe);
+            b.step("run-windows-gl-probe", "Run the native WGL capability and lifetime gate")
+                .dependOn(&run_probe.step);
+
+            const ipc_probe = b.addExecutable(.{
+                .name = "localterm-dev-gpu-frame-child",
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path("src/win32_gpu_frame_probe.zig"),
+                    .target = config.target,
+                    .optimize = config.optimize,
+                    .link_libc = true,
+                }),
+                .use_llvm = true,
+            });
+            ipc_probe.root_module.addImport("opengl", gl_dep.module("opengl"));
+            ipc_probe.root_module.addIncludePath(b.path("src"));
+            ipc_probe.root_module.addIncludePath(b.path("vendor/glad/include"));
+            ipc_probe.root_module.addCSourceFile(.{ .file = b.path("vendor/glad/src/gl.c") });
+            for ([_][]const u8{ "user32", "gdi32", "opengl32" }) |library|
+                ipc_probe.root_module.linkSystemLibrary(library, .{});
+            b.step("windows-gpu-frame-probe", "Build isolated GPU frame shared-memory child (component PoC)")
+                .dependOn(&b.addInstallArtifact(ipc_probe, .{}).step);
+
+            const text_worker = b.addExecutable(.{
+                .name = "localterm-render-text-worker",
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path("src/win32_render_text_worker.zig"),
+                    .target = config.target,
+                    .optimize = config.optimize,
+                    .link_libc = true,
+                }),
+                .use_llvm = true,
+            });
+            text_worker.root_module.addImport("opengl", gl_dep.module("opengl"));
+            text_worker.root_module.addIncludePath(b.path("vendor/glad/include"));
+            text_worker.root_module.addCSourceFile(.{ .file = b.path("vendor/glad/src/gl.c") });
+            for ([_][]const u8{ "user32", "gdi32", "opengl32" }) |library|
+                text_worker.root_module.linkSystemLibrary(library, .{});
+            b.step("windows-render-text-worker", "Build private text-frame GPU worker (not the terminal host)")
+                .dependOn(&b.addInstallArtifact(text_worker, .{}).step);
+            if (config.windows_remote_renderer) b.getInstallStep().dependOn(&b.addInstallArtifact(text_worker, .{}).step);
+
+            const cache_check = b.addExecutable(.{
+                .name = "localterm-render-text-cache-check",
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path("src/win32_render_text_cache_check.zig"),
+                    .target = config.target,
+                    .optimize = config.optimize,
+                    .link_libc = true,
+                }),
+                .use_llvm = true,
+            });
+            cache_check.root_module.addImport("opengl", gl_dep.module("opengl"));
+            cache_check.root_module.addIncludePath(b.path("vendor/glad/include"));
+            cache_check.root_module.addCSourceFile(.{ .file = b.path("vendor/glad/src/gl.c") });
+            for ([_][]const u8{ "user32", "gdi32", "opengl32" }) |library| cache_check.root_module.linkSystemLibrary(library, .{});
+            b.step("windows-render-text-cache-check", "Build GPU-context text resource reuse/resize check (not host readiness)")
+                .dependOn(&b.addInstallArtifact(cache_check, .{}).step);
+
+            const image_cache_check = b.addExecutable(.{
+                .name = "localterm-render-image-cache-check",
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path("src/win32_render_image_cache_check.zig"),
+                    .target = config.target,
+                    .optimize = config.optimize,
+                    .link_libc = true,
+                }),
+                .use_llvm = true,
+            });
+            image_cache_check.root_module.addImport("opengl", gl_dep.module("opengl"));
+            image_cache_check.root_module.addIncludePath(b.path("vendor/glad/include"));
+            image_cache_check.root_module.addCSourceFile(.{ .file = b.path("vendor/glad/src/gl.c") });
+            for ([_][]const u8{ "user32", "gdi32", "opengl32" }) |library| image_cache_check.root_module.linkSystemLibrary(library, .{});
+            b.step("windows-render-image-cache-check", "Build GPU image upload/cache component check (not terminal images)")
+                .dependOn(&b.addInstallArtifact(image_cache_check, .{}).step);
+
+            const image_frame_check = b.addExecutable(.{
+                .name = "localterm-render-image-frame-check",
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path("src/win32_render_image_frame_check.zig"),
+                    .target = config.target,
+                    .optimize = config.optimize,
+                    .link_libc = true,
+                }),
+                .use_llvm = true,
+            });
+            image_frame_check.root_module.addImport("opengl", gl_dep.module("opengl"));
+            image_frame_check.root_module.addIncludePath(b.path("vendor/glad/include"));
+            image_frame_check.root_module.addCSourceFile(.{ .file = b.path("vendor/glad/src/gl.c") });
+            for ([_][]const u8{ "user32", "gdi32", "opengl32" }) |library| image_frame_check.root_module.linkSystemLibrary(library, .{});
+            b.step("windows-render-image-frame-check", "Build GPU image compositing component check (not terminal images)")
+                .dependOn(&b.addInstallArtifact(image_frame_check, .{}).step);
+
+            const late_reply_worker = b.addExecutable(.{
+                .name = "localterm-render-late-reply-test-worker",
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path("src/win32_render_late_reply_test_worker.zig"),
+                    .target = config.target,
+                    .optimize = config.optimize,
+                    .link_libc = true,
+                }),
+                .use_llvm = true,
+            });
+            late_reply_worker.root_module.addImport("opengl", gl_dep.module("opengl"));
+            late_reply_worker.root_module.addIncludePath(b.path("vendor/glad/include"));
+            late_reply_worker.root_module.addCSourceFile(.{ .file = b.path("vendor/glad/src/gl.c") });
+            for ([_][]const u8{ "user32", "gdi32", "opengl32" }) |library|
+                late_reply_worker.root_module.linkSystemLibrary(library, .{});
+
+            const client_check = b.addExecutable(.{
+                .name = "localterm-render-client-check",
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path("src/render_worker_client_check.zig"),
+                    .target = config.target,
+                    .optimize = config.optimize,
+                    .link_libc = true,
+                }),
+                .use_llvm = true,
+            });
+            client_check.root_module.addCSourceFile(.{ .file = b.path("src/render_worker_client_check.c"), .flags = &.{"-std=c11"} });
+            client_check.root_module.linkSystemLibrary("kernel32", .{});
+            const offscreen_worker = b.addExecutable(.{
+                .name = "localterm-render-text-worker",
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path("src/win32_render_offscreen_test_worker.zig"),
+                    .target = config.target,
+                    .optimize = config.optimize,
+                    .link_libc = true,
+                }),
+                .use_llvm = true,
+            });
+            offscreen_worker.root_module.addImport("opengl", gl_dep.module("opengl"));
+            offscreen_worker.root_module.addIncludePath(b.path("vendor/glad/include"));
+            offscreen_worker.root_module.addCSourceFile(.{ .file = b.path("vendor/glad/src/gl.c") });
+            for ([_][]const u8{ "user32", "gdi32", "opengl32" }) |library|
+                offscreen_worker.root_module.linkSystemLibrary(library, .{});
+            const check_step = b.step("windows-render-client-check", "Build private worker checks (execution includes real WGL/GPU fixtures)");
+            check_step.dependOn(&b.addInstallArtifact(client_check, .{}).step);
+            check_step.dependOn(&b.addInstallArtifact(offscreen_worker, .{}).step);
+            check_step.dependOn(&b.addInstallArtifact(late_reply_worker, .{}).step);
+
+            const bench = b.addExecutable(.{
+                .name = "localterm-dev-frame-bench",
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path("src/win32_frame_bench.zig"),
+                    .target = config.target,
+                    .optimize = config.optimize,
+                    .link_libc = true,
+                }),
+                .use_llvm = true,
+            });
+            bench.root_module.addImport("opengl", gl_dep.module("opengl"));
+            bench.root_module.addIncludePath(b.path("vendor/glad/include"));
+            bench.root_module.addCSourceFile(.{ .file = b.path("vendor/glad/src/gl.c") });
+            for ([_][]const u8{ "user32", "gdi32", "opengl32" }) |library|
+                bench.root_module.linkSystemLibrary(library, .{});
+            b.step("windows-frame-bench", "Build offscreen 1080p readback/conversion/memory-DC component benchmark (not app FPS)")
+                .dependOn(&b.addInstallArtifact(bench, .{}).step);
+        }
+    }
+
     // Ghostty dependencies used by many artifacts.
     const deps = try buildpkg.SharedDeps.init(b, &config);
 
@@ -392,6 +652,24 @@ pub fn build(b: *std.Build) !void {
             // Crash on x86_64 without this
             .use_llvm = true,
         });
+        if (test_exe.root_module.resolved_target.?.result.os.tag == .windows) {
+            // Private test dependency: never installed with app/portable artifacts.
+            const child = b.addExecutable(.{
+                .name = "command-inheritance-child",
+                .root_module = b.createModule(.{
+                    .target = config.baselineTarget(b.graph.io),
+                    .optimize = .Debug,
+                    .link_libc = true,
+                }),
+            });
+            child.root_module.addCSourceFile(.{
+                .file = b.path("tools/windows/command-inheritance-child.c"),
+                .flags = &.{"-std=c11"},
+            });
+            const options = b.addOptions();
+            options.addOptionPath("child_path", child.getEmittedBin());
+            test_exe.root_module.addOptions("windows_command_inheritance_options", options);
+        }
         if (config.emit_test_exe) {
             const test_exe_install = b.addInstallArtifact(test_exe, .{});
             config.addPatchElf(test_exe, &test_exe_install.step);

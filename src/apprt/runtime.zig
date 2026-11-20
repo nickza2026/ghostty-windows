@@ -11,6 +11,9 @@ pub const Runtime = enum {
     /// approach to building the application.
     gtk,
 
+    /// Experimental native Windows runtime. Explicit opt-in; not a full terminal yet.
+    win32,
+
     pub fn default(target: std.Target) Runtime {
         return switch (target.os.tag) {
             // The Linux and FreeBSD default is GTK because it is a full

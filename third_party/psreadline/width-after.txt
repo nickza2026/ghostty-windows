@@ -1,0 +1,11 @@
+        private static int LengthInBufferCells(char c)
+        {
+            // App-owned correction: combining marks occupy no additional console cells.
+            var category = Char.GetUnicodeCategory(c);
+            if (category == System.Globalization.UnicodeCategory.NonSpacingMark ||
+                category == System.Globalization.UnicodeCategory.EnclosingMark)
+            {
+                return 0;
+            }
+
+            if (c < 256)

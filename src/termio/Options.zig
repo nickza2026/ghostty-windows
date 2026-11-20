@@ -30,9 +30,10 @@ mailbox: termio.Mailbox,
 /// terminal implementation.)
 renderer_state: *renderer.State,
 
-/// A handle to wake up the renderer. This hints to the renderer that
-/// a repaint should happen.
-renderer_wakeup: xev.Async,
+/// Borrow the renderer's stable Async instance. IOCP stores the waiter inline;
+/// copying the value before renderer thread registration loses notifications.
+/// The renderer owns/deinitializes it; termio must never do so.
+renderer_wakeup: *xev.Async,
 
 /// The mailbox for renderer messages.
 renderer_mailbox: *renderer.Thread.Mailbox,

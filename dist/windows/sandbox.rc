@@ -1,0 +1,25 @@
+LANGUAGE 0, 0
+1 24 "sandbox.manifest"
+
+1 VERSIONINFO
+FILEVERSION 0,0,0,0
+PRODUCTVERSION 0,0,0,0
+FILEOS 0x00040004
+FILETYPE 0x00000001
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"
+        BEGIN
+            VALUE "FileDescription", "Sandbox"
+            VALUE "FileVersion", "0.0.0.0"
+            VALUE "OriginalFilename", "Sandbox.exe"
+            VALUE "ProductName", "Sandbox"
+            VALUE "ProductVersion", "0.0.0.0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0409, 1200
+    END
+END

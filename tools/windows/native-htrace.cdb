@@ -1,0 +1,15 @@
+$$ Own native lifecycle fixture only. No dumps/global GFlags/heap changes.
+!htrace -enable 0x10000
+bu ntdll!NtCreateEvent ".printf \"LOCALTERM_EVENT_CREATE tid=%x out=%p\n\", @$tid, @rcx; k; gc"
+bd 0
+bu ntdll!NtCreateThreadEx ".printf \"LOCALTERM_THREAD_CREATE tid=%x out=%p\n\", @$tid, @rcx; k; gc"
+bd 1
+bu ntdll!NtDuplicateObject ".printf \"LOCALTERM_DUPLICATE tid=%x source=%p out=%p\n\", @$tid, @rdx, @r9; k; gc"
+bd 2
+bu ntdll!NtOpenEvent ".printf \"LOCALTERM_EVENT_OPEN tid=%x out=%p\n\", @$tid, @rcx; k; gc"
+bd 3
+bu ntdll!NtCreateIoCompletion ".printf \"LOCALTERM_IOCOMPLETION_CREATE tid=%x out=%p\n\", @$tid, @rcx; k; gc"
+bd 4
+bm *!localterm_native_htrace_marker ".if (@rcx == 1) { .echo LOCALTERM_NATIVE_HTRACE_BASELINE; !htrace -snapshot; be 0 1 2 3 4; gc } .else { bd 0 1 2 3 4; .echo LOCALTERM_NATIVE_HTRACE_FINAL; !htrace -diff; gc }"
+bl
+g

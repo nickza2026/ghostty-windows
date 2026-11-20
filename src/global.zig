@@ -14,6 +14,8 @@ const apprt = @import("apprt.zig");
 const assert = @import("quirks.zig").inlineAssert;
 const allocTmpDir = @import("os/file.zig").allocTmpDir;
 const freeTmpDir = @import("os/file.zig").freeTmpDir;
+const WindowsPortable = @import("apprt/win32/portable_paths.zig");
+const WindowsSandbox = @import("apprt/win32/sandbox_native.zig");
 
 // This file should only be imported for certain platforms.
 comptime {
@@ -121,7 +123,29 @@ pub fn init(opts: InitOpts) !void {
     });
 
     // Discover and save the temporary directory path
-    self.tmp_dir_path = try allocTmpDir(self.alloc, self.environ);
+    if (comptime builtin.os.tag == .windows and build_config.app_runtime == .win32) {
+        if (comptime build_config.windows_sandbox_default) {
+            const executable = try std.process.executablePathAlloc(self.io(), self.alloc);
+            defer self.alloc.free(executable);
+            const system_root = try self.environ.getAlloc(self.alloc, "SystemRoot");
+            defer self.alloc.free(system_root);
+            const program_data = try self.environ.getAlloc(self.alloc, "ProgramData");
+            defer self.alloc.free(program_data);
+            self.windows_sandbox = try WindowsSandbox.Context.init(self.alloc, self.io(), executable, .{ .system_root = system_root, .program_data = program_data });
+            self.windows_portable = try WindowsPortable.Layout.initSandbox(self.alloc, self.io(), self.windows_sandbox.?.plan.root);
+        } else {
+            const exe_dir = try std.process.executableDirPathAlloc(self.io(), self.alloc);
+            defer self.alloc.free(exe_dir);
+            self.windows_portable = if (comptime build_config.windows_portable_default)
+                try @import("apprt/win32/portable_auto.zig").init(self.alloc, self.io(), exe_dir)
+            else
+                try WindowsPortable.Layout.init(self.alloc, self.io(), exe_dir);
+        }
+    }
+    self.tmp_dir_path = if (self.windows_portable) |*layout|
+        try layout.path(self.alloc, .tmp)
+    else
+        try allocTmpDir(self.alloc, self.environ);
 
     // We first try to parse any action that we may be executing.
     // Tool binaries (ghostty-bench, ghostty-gen) have their own action
@@ -146,6 +170,7 @@ pub fn init(opts: InitOpts) !void {
     // this. Env vars are useful for logging too because they are
     // easy to set.
     logging: {
+        if (comptime build_config.windows_sandbox_default) break :logging;
         const v = self.environ.getAlloc(self.alloc, "GHOSTTY_LOG") catch |err| switch (err) {
             error.EnvironmentVariableMissing => break :logging,
             else => return err,
@@ -180,7 +205,7 @@ pub fn init(opts: InitOpts) !void {
     // As early as possible, initialize our resource limits.
     self.rlimits = .init();
 
-    if (build_options.sentry) {
+    if (build_options.sentry and self.windows_portable == null) {
         // Initialize our crash reporting. The environ map snapshot is
         // owned by crash.init (it is freed by the init thread).
         const environ_map = try self.environ.createMap(self.alloc);
@@ -239,6 +264,8 @@ pub fn deinit() void {
 
     // Release our tmp_dir_path if needed
     if (self.tmp_dir_path) |td| freeTmpDir(self.alloc, td);
+    if (self.windows_portable) |*layout| layout.deinit();
+    if (self.windows_sandbox) |*sandbox| sandbox.deinit();
 
     // Release our I/O instance
     self.io_impl.deinit();
@@ -281,7 +308,13 @@ pub fn environ() std.process.Environ {
 /// from testing. The map is created off of the state allocator.
 ///
 /// Asserts that the global state is initialized when not running as a test.
-pub fn environMap() !std.process.Environ.Map {
+pub fn environMap() error{ OutOfMemory, Unexpected }!std.process.Environ.Map {
+    if (comptime build_config.windows_sandbox_default) {
+        // Preserve this helper's existing CLI/theme error contract. Missing
+        // sandbox state is still fatal to the caller, never host-env fallback.
+        const context = sandboxContext() orelse return error.Unexpected;
+        return context.freshEnvironment(state.?.alloc);
+    }
     if (builtin.is_test) return std.testing.environ.createMap(std.testing.allocator);
 
     return state.?.environ.createMap(state.?.alloc);
@@ -339,6 +372,18 @@ pub fn tmpDirPath() []const u8 {
     return state.?.tmp_dir_path.?;
 }
 
+/// App-only path selection; never mutates child HOME/APPDATA/account state.
+pub fn sandboxContext() ?*const WindowsSandbox.Context {
+    if (state) |*s| if (s.windows_sandbox) |*context| return context;
+    return null;
+}
+
+pub fn portablePaths() ?*const WindowsPortable.Layout {
+    if (builtin.is_test) return null;
+    if (state.?.windows_portable) |*layout| return layout;
+    return null;
+}
+
 /// Returns the global state resources_dir, or an empty one when testing.
 ///
 /// Asserts that the global state is initialized when not running as a test.
@@ -383,6 +428,8 @@ pub const GlobalState = struct {
     environ: std.process.Environ,
     args: std.process.Args,
     tmp_dir_path: ?[]const u8,
+    windows_portable: ?WindowsPortable.Layout = null,
+    windows_sandbox: ?WindowsSandbox.Context = null,
     action: ?cli.ghostty.Action,
     logging: Logging,
     rlimits: ResourceLimits = .{},

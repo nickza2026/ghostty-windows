@@ -25,6 +25,11 @@ wasm_target: WasmTarget,
 /// Comptime interfaces
 app_runtime: ApprtRuntime = .none,
 renderer: RendererBackend = .opengl,
+windows_remote_renderer: bool = false,
+windows_remote_images: bool = false,
+windows_portable_default: bool = false,
+windows_portable_tools_default: bool = false,
+windows_sandbox_default: bool = false,
 font_backend: FontBackend = .freetype,
 
 /// Feature flags
@@ -208,6 +213,23 @@ pub fn init(b: *std.Build, appVersion: []const u8, libVersion: []const u8) !Conf
 
     //---------------------------------------------------------------
     // Feature Flags
+
+    config.windows_remote_renderer = b.option(bool, "windows-remote-renderer", "Experimental Win32 text-only GPU worker host; default renderer unchanged") orelse false;
+    config.windows_remote_images = b.option(bool, "windows-remote-images", "Experimental inline Kitty snapshots; requires remote renderer, default off") orelse false;
+    config.windows_portable_default = b.option(bool, "windows-portable-default", "Win32 portable distribution: create app-owned portable-data beside executable on first run; normal builds unchanged") orelse false;
+    if (config.windows_portable_default and (target.result.os.tag != .windows or config.app_runtime != .win32))
+        return error.PortableDefaultRequiresWin32Target;
+    config.windows_portable_tools_default = b.option(bool, "windows-portable-tools-default", "Win32 isolated Node/npm distribution; require portable data and runtime even on direct EXE launch") orelse false;
+    config.windows_sandbox_default = b.option(bool, "windows-sandbox-default", "Explicit owned root-level native sandbox distribution; no host shell or storage fallback") orelse false;
+    if (config.windows_sandbox_default and (target.result.os.tag != .windows or config.app_runtime != .win32))
+        return error.SandboxDefaultRequiresWin32Target;
+    if (config.windows_sandbox_default and (config.windows_portable_default or config.windows_portable_tools_default))
+        return error.SandboxDefaultConflictsWithPortable;
+    if (config.windows_portable_tools_default and !config.windows_portable_default)
+        return error.PortableToolsDefaultRequiresPortableDefault;
+    if (config.windows_remote_images and !config.windows_remote_renderer) return error.RemoteImagesRequireRemoteRenderer;
+    if (config.windows_remote_renderer and (target.result.os.tag != .windows or config.app_runtime != .win32 or config.renderer != .opengl))
+        return error.RemoteRendererRequiresWin32OpenGLTarget;
 
     config.flatpak = b.option(
         bool,
@@ -669,6 +691,11 @@ pub fn addOptions(self: *const Config, step: *std.Build.Step.Options) !void {
     step.addOption(ApprtRuntime, "app_runtime", self.app_runtime);
     step.addOption(FontBackend, "font_backend", self.font_backend);
     step.addOption(RendererBackend, "renderer", self.renderer);
+    step.addOption(bool, "windows_remote_renderer", self.windows_remote_renderer);
+    step.addOption(bool, "windows_remote_images", self.windows_remote_images);
+    step.addOption(bool, "windows_portable_default", self.windows_portable_default);
+    step.addOption(bool, "windows_portable_tools_default", self.windows_portable_tools_default);
+    step.addOption(bool, "windows_sandbox_default", self.windows_sandbox_default);
     step.addOption(ExeEntrypoint, "exe_entrypoint", self.exe_entrypoint);
     step.addOption(WasmTarget, "wasm_target", self.wasm_target);
     step.addOption(bool, "wasm_shared", self.wasm_shared);
@@ -765,6 +792,11 @@ pub fn fromOptions() Config {
         .app_runtime = std.meta.stringToEnum(ApprtRuntime, @tagName(options.app_runtime)).?,
         .font_backend = std.meta.stringToEnum(FontBackend, @tagName(options.font_backend)).?,
         .renderer = std.meta.stringToEnum(RendererBackend, @tagName(options.renderer)).?,
+        .windows_remote_renderer = options.windows_remote_renderer,
+        .windows_remote_images = options.windows_remote_images,
+        .windows_portable_default = options.windows_portable_default,
+        .windows_portable_tools_default = options.windows_portable_tools_default,
+        .windows_sandbox_default = options.windows_sandbox_default,
         .snap = options.snap,
         .exe_entrypoint = std.meta.stringToEnum(ExeEntrypoint, @tagName(options.exe_entrypoint)).?,
         .wasm_target = std.meta.stringToEnum(WasmTarget, @tagName(options.wasm_target)).?,

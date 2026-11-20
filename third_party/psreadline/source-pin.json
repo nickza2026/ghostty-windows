@@ -1,0 +1,10 @@
+{
+  "repository": "https://github.com/PowerShell/PSReadLine",
+  "tag": "v2.0.0",
+  "tagObject": "9405819aa9a5a6052e820c31cd053a038a85c092",
+  "commit": "6b5e9ff4bdfe15f67b3647e0d1ecdb6cf2e3bda6",
+  "archiveUrl": "https://codeload.github.com/PowerShell/PSReadLine/zip/6b5e9ff4bdfe15f67b3647e0d1ecdb6cf2e3bda6",
+  "archiveSha256": "C9AFF6362CE22DB35EC400130C83C5120335BBC5B299953AF3F5D28E5F1BF67C",
+  "sdk": "9.0.203",
+  "license": "MIT"
+}

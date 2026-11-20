@@ -1268,6 +1268,41 @@ test "metrics" {
 }
 
 // TODO: Also test CJK fallback sizing, we don't currently have a CJK test font.
+test "windows Thai fallback metrics" {
+    if (options.backend != .freetype_windows) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var lib = try Library.init(alloc);
+    defer lib.deinit();
+    var discovery = font.discovery.Windows.init(lib);
+    defer discovery.deinit();
+    var c = init();
+    defer c.deinit(alloc);
+    c.load_options = .{ .library = lib, .size = .{ .points = 12, .xdpi = 96, .ydpi = 96 } };
+    const cases = .{
+        .{ "Consolas", SizeAdjustment.none },
+        .{ "Leelawadee UI", SizeAdjustment.none },
+        .{ "Leelawadee UI", font.default_fallback_adjustment },
+    };
+    inline for (cases, 0..) |case, i| {
+        var it = try discovery.discover(alloc, .{ .family = case[0], .size = 12 });
+        defer it.deinit();
+        var deferred = (try it.next()) orelse return error.TestFontNotFound;
+        const index = c.addDeferred(alloc, deferred, .{
+            .style = .regular,
+            .fallback = false,
+            .size_adjustment = case[1],
+        }) catch |err| {
+            deferred.deinit();
+            return err;
+        };
+        const metrics = (try c.getFace(index)).getMetrics();
+        std.debug.print("Thai metrics family={s} adjustment={s} px_per_em={d:.4} cell_width={d:.4} ascent={d:.4} descent={d:.4}\n", .{
+            case[0], @tagName(case[1]), metrics.px_per_em, metrics.cell_width, metrics.ascent, metrics.descent,
+        });
+        if (i < 2) try std.testing.expectApproxEqAbs(@as(f64, 16), metrics.px_per_em, 0.01);
+    }
+}
+
 test "adjusted sizes" {
     const testing = std.testing;
     const alloc = testing.allocator;

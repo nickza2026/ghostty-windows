@@ -1159,6 +1159,20 @@ pub const Windows = struct {
             if (self.desc.family) |family| {
                 if (!familyMatches(face, family)) return false;
             }
+            // A family can contain multiple files/faces. Directory order must
+            // not choose Bold/Italic for a Regular request (or vice versa).
+            const ft = @import("freetype").c;
+            const flags = face.face.handle.*.style_flags;
+            const bold = flags & ft.FT_STYLE_FLAG_BOLD != 0;
+            const italic = flags & ft.FT_STYLE_FLAG_ITALIC != 0;
+            if (self.desc.style) |style| {
+                const name = face.face.handle.*.style_name orelse return false;
+                if (!std.ascii.eqlIgnoreCase(std.mem.span(name), style)) return false;
+                if (self.desc.bold and !bold) return false;
+                if (self.desc.italic and !italic) return false;
+            } else {
+                if (bold != self.desc.bold or italic != self.desc.italic) return false;
+            }
             if (self.desc.codepoint != 0) {
                 if (face.glyphIndex(self.desc.codepoint) == null) return false;
             }
@@ -1413,4 +1427,38 @@ test "windows" {
     var face = (try it.next()) orelse return error.TestFontNotFound;
     defer face.deinit();
     try testing.expect(face.hasCodepoint('A', null));
+}
+
+test "windows font discovery respects style traits" {
+    if (options.backend != .freetype_windows) return error.SkipZigTest;
+    const testing = std.testing;
+    const ft = @import("freetype").c;
+    var lib = try Library.init(testing.allocator);
+    defer lib.deinit();
+    var win = Windows.init(lib);
+    defer win.deinit();
+    const cases = [_]Descriptor{
+        .{ .family = "Consolas" },
+        .{ .family = "Consolas", .bold = true },
+        .{ .family = "Consolas", .italic = true },
+        .{ .family = "Consolas", .bold = true, .italic = true },
+        .{ .family = "Leelawadee UI" },
+        .{ .family = "Leelawadee UI", .bold = true },
+    };
+    for (cases) |desc| {
+        var it = try win.discover(testing.allocator, desc);
+        defer it.deinit();
+        var found = (try it.next()) orelse return error.TestFontNotFound;
+        defer found.deinit();
+        const flags = found.win.?.peek.face.handle.*.style_flags;
+        std.debug.print("Windows font style probe: requested family={s} bold={} italic={} selected style={s} path={s}\n", .{
+            desc.family.?,
+            desc.bold,
+            desc.italic,
+            if (found.win.?.peek.face.handle.*.style_name) |name| std.mem.span(name) else "",
+            found.win.?.path,
+        });
+        try testing.expectEqual(desc.bold, flags & ft.FT_STYLE_FLAG_BOLD != 0);
+        try testing.expectEqual(desc.italic, flags & ft.FT_STYLE_FLAG_ITALIC != 0);
+    }
 }

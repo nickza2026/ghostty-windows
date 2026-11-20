@@ -36,6 +36,31 @@ const File = std.Io.File;
 const EnvMap = std.process.Environ.Map;
 const apprt = @import("apprt.zig");
 
+/// Test-only receipts for the actual native attribute-list calls on this thread.
+/// No tracing state or failure injection is present in production builds.
+pub const WindowsAttributeListTest = if (builtin.is_test) struct {
+    pub const Failure = enum { none, before_initialize, after_initialize, after_update };
+    pub const Receipt = struct {
+        initialized: usize = 0,
+        updated: usize = 0,
+        create_attempts: usize = 0,
+        deleted: usize = 0,
+        deleted_before_create: usize = 0,
+    };
+    pub threadlocal var failure: Failure = .none;
+    pub threadlocal var receipt: Receipt = .{};
+
+    pub fn reset() void {
+        failure = .none;
+        receipt = .{};
+    }
+} else struct {};
+
+fn deleteWindowsAttributeList(list: windows.LPPROC_THREAD_ATTRIBUTE_LIST) void {
+    windows.exp.kernel32.DeleteProcThreadAttributeList(list);
+    if (builtin.is_test) WindowsAttributeListTest.receipt.deleted += 1;
+}
+
 /// Function prototype for a function executed /in the child process/ after the
 /// fork, but before exec'ing the command. If the function returns a u8, the
 /// child process will be exited with that error code.
@@ -356,6 +381,10 @@ fn startWindows(self: *Command, arena: Allocator) !void {
     // attributes such that the child process only inherits these handles,
     // then set bInheritsHandles below.
 
+    // Own only a successfully initialized native list. Keep it alive across
+    // the branch and CreateProcessW, then delete before start's arena is freed.
+    var initialized_attribute_list: windows.LPPROC_THREAD_ATTRIBUTE_LIST = null;
+    defer if (initialized_attribute_list) |list| deleteWindowsAttributeList(list);
     const attribute_list, const stdin, const stdout, const stderr = if (self.pseudo_console) |pseudo_console| b: {
         var attribute_list_size: usize = undefined;
         _ = windows.exp.kernel32.InitializeProcThreadAttributeList(
@@ -366,6 +395,8 @@ fn startWindows(self: *Command, arena: Allocator) !void {
         );
 
         const attribute_list_buf = try arena.alloc(u8, attribute_list_size);
+        if (builtin.is_test and WindowsAttributeListTest.failure == .before_initialize)
+            return error.TestAttributeBeforeInitialize;
         if (windows.exp.kernel32.InitializeProcThreadAttributeList(
             attribute_list_buf.ptr,
             1,
@@ -373,6 +404,12 @@ fn startWindows(self: *Command, arena: Allocator) !void {
             &attribute_list_size,
         ) == windows.FALSE) return windows.unexpectedError(windows.GetLastError());
 
+        initialized_attribute_list = attribute_list_buf.ptr;
+        if (builtin.is_test) {
+            WindowsAttributeListTest.receipt.initialized += 1;
+            if (WindowsAttributeListTest.failure == .after_initialize)
+                return error.TestAttributeAfterInitialize;
+        }
         if (windows.exp.kernel32.UpdateProcThreadAttribute(
             attribute_list_buf.ptr,
             0,
@@ -383,6 +420,11 @@ fn startWindows(self: *Command, arena: Allocator) !void {
             null,
         ) == windows.FALSE) return windows.unexpectedError(windows.GetLastError());
 
+        if (builtin.is_test) {
+            WindowsAttributeListTest.receipt.updated += 1;
+            if (WindowsAttributeListTest.failure == .after_update)
+                return error.TestAttributeAfterUpdate;
+        }
         break :b .{ attribute_list_buf.ptr, null, null, null };
     } else b: {
         const stdin = if (self.stdin) |f| f.handle else null_fd.?;
@@ -418,13 +460,20 @@ fn startWindows(self: *Command, arena: Allocator) !void {
     var flags: windows.DWORD = windows.CREATE_UNICODE_ENVIRONMENT;
     if (attribute_list != null) flags |= windows.EXTENDED_STARTUPINFO_PRESENT;
 
+    // ConPTY connects through its process attribute, not inherited stdio.
+    // Do not leak unrelated inheritable handles from overlapping launches.
+    const inherit_handles = if (self.pseudo_console != null) windows.FALSE else windows.TRUE;
     var process_information: windows.PROCESS_INFORMATION = undefined;
+    if (builtin.is_test) {
+        WindowsAttributeListTest.receipt.create_attempts += 1;
+        WindowsAttributeListTest.receipt.deleted_before_create = WindowsAttributeListTest.receipt.deleted;
+    }
     if (windows.exp.kernel32.CreateProcessW(
         null,
         command_line_w.ptr,
         null,
         null,
-        windows.TRUE,
+        inherit_handles,
         flags,
         if (env_w) |w| w.ptr else null,
         if (cwd_w) |w| w.ptr else null,
@@ -432,7 +481,21 @@ fn startWindows(self: *Command, arena: Allocator) !void {
         &process_information,
     ) == windows.FALSE) return windows.unexpectedError(windows.GetLastError());
 
+    // CreateProcessW transfers two handles to us. The initial thread is never
+    // used after launch; the process stays owned by Command until deinit.
+    _ = windows.exp.kernel32.CloseHandle(process_information.hThread);
     self.pid = process_information.hProcess;
+}
+
+/// Release the owned Windows process handle without terminating the process.
+/// Call after wait/stop, or after an external-exit notification. Watchers that
+/// need a longer lifetime must own a duplicate (as libxev's IOCP watcher does).
+/// POSIX waitpid owns reaping instead, so this is a no-op there.
+pub fn deinit(self: *Command) void {
+    if (comptime builtin.os.tag == .windows) {
+        if (self.pid) |pid| _ = windows.exp.kernel32.CloseHandle(pid);
+        self.pid = null;
+    }
 }
 
 fn setupFd(src: File.Handle, target: i32) !void {
@@ -1018,6 +1081,65 @@ test "Command: posix fork handles execveZ failure" {
     const exit = try cmd.wait(true);
     try testing.expect(exit == .Exited);
     try testing.expect(exit.Exited == 1);
+}
+
+test "Windows ConPTY isolates private inheritable canary" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    try @import("windows_command_inheritance_test.zig").run();
+}
+
+test "Windows ConPTY attributes cleanup after successful launch" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    try @import("windows_command_inheritance_test.zig").runAttributes(.success);
+}
+
+test "Windows ConPTY attributes untouched before initialization" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    try @import("windows_command_inheritance_test.zig").runAttributes(.before_initialize);
+}
+
+test "Windows ConPTY attributes cleanup after initialization error" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    try @import("windows_command_inheritance_test.zig").runAttributes(.after_initialize);
+}
+
+test "Windows ConPTY attributes cleanup after update error" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    try @import("windows_command_inheritance_test.zig").runAttributes(.after_update);
+}
+
+test "Windows ConPTY attributes cleanup after native launch failure" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    try @import("windows_command_inheritance_test.zig").runAttributes(.launch_failure);
+}
+
+test "Windows command process ownership releases original handle once" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const Native = struct {
+        extern "kernel32" fn GetCurrentProcess() callconv(.winapi) std.os.windows.HANDLE;
+        extern "kernel32" fn DuplicateHandle(std.os.windows.HANDLE, std.os.windows.HANDLE, std.os.windows.HANDLE, *std.os.windows.HANDLE, u32, i32, u32) callconv(.winapi) i32;
+    };
+    const current = Native.GetCurrentProcess();
+    var owned: std.os.windows.HANDLE = undefined;
+    try testing.expect(Native.DuplicateHandle(current, current, current, &owned, 0, 0, 2) != 0);
+    var cmd: Command = .{
+        .path = "unused",
+        .args = &.{},
+        .pid = owned,
+        .os_pre_exec = null,
+        .rt_pre_exec = null,
+        .rt_post_fork = null,
+        .rt_pre_exec_info = undefined,
+        .rt_post_fork_info = undefined,
+    };
+    defer cmd.deinit();
+    var code: windows.DWORD = 0;
+    try testing.expect(windows.exp.kernel32.GetExitCodeProcess(owned, &code) != windows.FALSE);
+    cmd.deinit();
+    try testing.expect(cmd.pid == null);
+    try testing.expect(windows.exp.kernel32.GetExitCodeProcess(owned, &code) == windows.FALSE);
+    try testing.expect(windows.GetLastError() == .INVALID_HANDLE);
+    cmd.deinit();
 }
 
 // If cmd.start fails with error.ExecFailedInChild it's the _child_ process that is running. If it does not
